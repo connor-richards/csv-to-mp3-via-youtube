@@ -1,0 +1,23 @@
+# Ignore downloads, tools, and local artifacts
+downloads/
+test_downloads/
+tools/
+*.log
+*.bak
+*.zip
+*.tmp
+*.temp
+*.cache
+*.pyc
+.venv
+__pycache__/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Ignore OS files
+ehthumbs.db
+Icon\r
+
+# Ignore local CSV export (do not commit large exported libraries)
+*.csv
