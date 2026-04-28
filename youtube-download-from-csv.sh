@@ -14,6 +14,27 @@ START_INDEX=1
 USE_PLAYLISTS=0
 ENABLE_SLEEP=0
 
+# Colorized output helpers (TTY-aware). Set NO_COLOR to disable colors.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  RED=$'\e[31m'
+  GREEN=$'\e[32m'
+  YELLOW=$'\e[33m'
+  BLUE=$'\e[34m'
+  MAGENTA=$'\e[35m'
+  CYAN=$'\e[36m'
+  BOLD=$'\e[1m'
+  RESET=$'\e[0m'
+else
+  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; BOLD=''; RESET=''
+fi
+
+ce_section()  { printf "%b\n" "${BOLD}${CYAN}$*${RESET}"; }
+ce_heading()  { printf "%b\n" "${BOLD}${MAGENTA}$*${RESET}"; }
+ce_info()     { printf "%b\n" "${CYAN}$*${RESET}"; }
+ce_success()  { printf "%b\n" "${GREEN}$*${RESET}"; }
+ce_warn()     { printf "%b\n" "${YELLOW}$*${RESET}" >&2; }
+ce_error()    { printf "%b\n" "${RED}$*${RESET}" >&2; }
+
 usage() {
   cat <<USAGE
 Usage: $0 [--dry-run] [--limit N] [--start N] [--use-playlists] [--enable-sleep] <input.csv> <target_dir>
@@ -64,7 +85,7 @@ CSV="$1"
 TARGET_DIR="$2"
 
 if [ ! -f "$CSV" ]; then
-  echo "Input CSV not found: $CSV" >&2
+  ce_error "Input CSV not found: $CSV"
   exit 1
 fi
 
@@ -79,7 +100,7 @@ if [ "$START_INDEX" -lt 1 ]; then
 fi
 
 if [ "$START_INDEX" -gt 1 ]; then
-  echo "Resuming at track $START_INDEX"
+  ce_info "Resuming at track $START_INDEX"
 fi
 
 HAVE_PYTHON=0
@@ -113,14 +134,14 @@ fi
 
 if [ -z "$YTDLP_BIN" ]; then
   if [ "$DRY_RUN" -eq 0 ]; then
-    echo "yt-dlp not found. Install yt-dlp (try: ${PY_EXEC:-python} -m pip install --user -U yt-dlp)" >&2
+    ce_error "yt-dlp not found. Install yt-dlp (try: ${PY_EXEC:-python} -m pip install --user -U yt-dlp)"
     exit 1
   else
-    echo "Note: yt-dlp not found; dry-run will be limited." >&2
+    ce_warn "Note: yt-dlp not found; dry-run will be limited."
   fi
 fi
 
-command -v ffmpeg >/dev/null 2>&1 || echo "Warning: ffmpeg not found. Real downloads may fail without ffmpeg." >&2
+command -v ffmpeg >/dev/null 2>&1 || ce_warn "Warning: ffmpeg not found. Real downloads may fail without ffmpeg."
 
 STATE_DIR="$TARGET_DIR/.ydl_state"
 mkdir -p "$STATE_DIR"
@@ -287,7 +308,7 @@ fi
 if [ "$DRY_RUN" -eq 1 ]; then
   info="$info (dry-run mode)"
 fi
-echo "$info Starting downloads..."
+ce_section "$info Starting downloads..."
 
 # sanitize: basic filename-safe substitutions
 sanitize() {
@@ -331,12 +352,12 @@ while IFS=$'\t' read -r playlist track artist || [ -n "$track" ]; do
   target="$tdir/$fname.mp3"
 
   if [ -f "$target" ]; then
-    echo "[$count/$total] Skipping (exists): $target"
+    ce_info "[$count/$total] Skipping (exists): $target"
     echo "$playlist|$track|$artist|skipped" >> "$PROGRESS_LOG"
     continue
   fi
 
-  echo "[$count/$total] Searching/Downloading: $track - $artist (Playlist: $playlist)"
+  ce_heading "[$count/$total] Searching/Downloading: $track - $artist (Playlist: $playlist)"
   tmpd=$(mktemp -d)
 
   max_attempts=3
@@ -364,7 +385,7 @@ while IFS=$'\t' read -r playlist track artist || [ -n "$track" ]; do
           err=$(cat "$tmp_err" || true)
           rm -f "$tmp_err"
           if [ -n "$fn" ]; then
-            echo "  Would download: $fn -> $target"
+            ce_info "  Would download: $fn -> $target"
             echo "$playlist|$track|$artist|dryrun" >> "$PROGRESS_LOG"
             success=1
             break 2
@@ -399,29 +420,29 @@ while IFS=$'\t' read -r playlist track artist || [ -n "$track" ]; do
         found=$(find "$tmpd" -type f -iname '*.mp3' -print -quit || true)
         if [ -n "$found" ] && [ -s "$found" ]; then
           mv "$found" "$target"
-          echo "  Saved: $target"
+          ce_success "  Saved: $target"
           echo "$playlist|$track|$artist|done" >> "$PROGRESS_LOG"
           success=1
           break 2
         fi
         if echo "$err" | grep -Ei 'Sign in to confirm|not a bot|Failed to decrypt with DPAPI|could not find .* cookies database' >/dev/null 2>&1; then
           auth_error=1
-          echo "    Query produced auth/cookie error; trying next template..."
+          ce_warn "    Query produced auth/cookie error; trying next template..."
           continue
         fi
         if echo "$err" | grep -Ei 'HTTP Error 429|Too Many Requests|rate limit|quota' >/dev/null 2>&1; then
           backoff=$((60 + RANDOM % 120))
-          echo "  Detected rate-limiting signal. Backing off for $backoff seconds..."
+          ce_warn "  Detected rate-limiting signal. Backing off for $backoff seconds..."
           sleep $backoff
         else
-          echo "  Attempt $attempt for query failed (rc=$rc). Will try next template or retry later."
+          ce_warn "  Attempt $attempt for query failed (rc=$rc). Will try next template or retry later."
           sleep $((attempt * 2 + RANDOM % 4))
         fi
       done
       if [ "$auth_error" -eq 1 ] && [ "$success" -ne 1 ]; then
-        echo "  yt-dlp requires authentication/cookies (bot check or DPAPI error). Skipping track."
-        echo "  Hint: export browser cookies to a cookies.txt file and re-run with YTDLP_COOKIES_FILE=path, or run natively on Windows and use YTDLP_COOKIES_FROM_BROWSER=<browser>."
-        echo "  (See README for export instructions)"
+        ce_warn "  yt-dlp requires authentication/cookies (bot check or DPAPI error). Skipping track."
+        ce_info "  Hint: export browser cookies to a cookies.txt file and re-run with YTDLP_COOKIES_FILE=path, or run natively on Windows and use YTDLP_COOKIES_FROM_BROWSER=<browser>."
+        ce_info "  (See README for export instructions)"
         echo "$playlist|$track|$artist|failed_auth" >> "$PROGRESS_LOG"
         break
       fi
@@ -429,7 +450,8 @@ while IFS=$'\t' read -r playlist track artist || [ -n "$track" ]; do
   done
 
   if [ $success -ne 1 ]; then
-    echo "Failed to download: $track - $artist" | tee -a "$FAILED_LOG"
+    ce_error "Failed to download: $track - $artist"
+    echo "$track - $artist" | tee -a "$FAILED_LOG"
     echo "$playlist|$track|$artist|failed" >> "$PROGRESS_LOG"
   fi
 
