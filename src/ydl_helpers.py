@@ -1,8 +1,21 @@
 """Helpers for interacting with yt-dlp (module or CLI) and format selection.
 
-This module prefers the `yt_dlp` Python module when available and falls
-back to invoking the `yt-dlp` CLI when necessary. It exposes a minimal
-API used by `download_from_csv.py`.
+Metadata extraction (``dump_json``) always uses the yt-dlp CLI subprocess so
+that ``subprocess.run(timeout=...)`` provides a hard wall-clock cap.  The
+``yt_dlp`` Python module is only used for actual downloading
+(``download_with_format``), where it falls back to the CLI if needed.
+
+The venv-local yt-dlp binary is preferred over any system-installed one so
+that both code paths use the same version.
+
+Public API used by ``download_from_csv.py``:
+  detect_ytdlp()         -- describe available yt-dlp module and binary
+  detect_js_runtime()    -- find a usable JS runtime (deno, node, etc.)
+  dump_json(url, ...)    -- fetch video/search metadata via CLI
+  select_format_id(info) -- pick best audio format_id from metadata
+  download_with_format() -- download a URL and extract to MP3
+  preflight_check()      -- validate duration/filesize/views before download
+  parse_size_to_bytes()  -- parse human size strings like '30M'
 """
 from __future__ import annotations
 
@@ -24,8 +37,18 @@ def detect_ytdlp() -> dict:
     Keys:
       - "module": the imported yt_dlp module or None
       - "bin": path to `yt-dlp` CLI or None
+
+    Prefers the venv-local binary over the system one so the same version
+    is used for both module and subprocess calls.
     """
-    return {"module": _yt_dlp, "bin": shutil.which("yt-dlp")}
+    # prefer binary sitting next to the current Python interpreter (venv)
+    import os
+    venv_bin = os.path.join(os.path.dirname(sys.executable), "yt-dlp")
+    if os.path.isfile(venv_bin) and os.access(venv_bin, os.X_OK):
+        cli = venv_bin
+    else:
+        cli = shutil.which("yt-dlp")
+    return {"module": _yt_dlp, "bin": cli}
 
 
 def detect_js_runtime() -> t.Optional[tuple[str, str]]:
@@ -63,8 +86,12 @@ def _parse_first_json_from_text(text: str) -> t.Optional[dict]:
 
 def dump_json(url: str, *, cookies: t.Optional[str] = None, user_agent: t.Optional[str] = None,
               cookies_from_browser: t.Optional[str] = None, js_runtime: t.Optional[str] = None,
-              timeout: int = 30) -> dict:
+              timeout: int = 30, flat: bool = False) -> dict:
     """Return extracted metadata for `url`.
+
+    When ``flat=True``, passes ``--flat-playlist`` so that search/playlist URLs
+    return just the list of entries (id, title, url) without fetching full video
+    metadata for each entry.  This is much faster for ``ytsearch:`` queries.
 
     Returns a dict when JSON could be parsed. If yt-dlp prints only an error
     message (no JSON), the returned dict will contain an `__error__` key with
@@ -72,45 +99,37 @@ def dump_json(url: str, *, cookies: t.Optional[str] = None, user_agent: t.Option
     """
     info = None
     ytd = detect_ytdlp()
-    # If caller requested cookies-from-browser, prefer CLI path (module can't import browser cookies)
-    use_cli = False
-    if cookies_from_browser:
-        use_cli = True
+    # Always use the CLI subprocess for metadata extraction.
+    # The module's extract_info has no hard wall-clock timeout — on age-gated or
+    # geo-blocked videos yt-dlp cycles through multiple player clients
+    # (ios/android/web) and can hang indefinitely.  The CLI subprocess uses
+    # subprocess.run(timeout=...) which provides a reliable hard cap.
+    # Now that detect_ytdlp() prefers the venv binary the CLI is the same
+    # version as the module, so there's no regression in behaviour.
 
-    if ytd["module"] is not None and not use_cli:
-        opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-        if cookies:
-            opts["cookiefile"] = cookies
-        if user_agent:
-            opts.setdefault("http_headers", {})["User-Agent"] = user_agent
-        # support passing a js runtime string (e.g. 'deno' or 'deno:/path')
-        if js_runtime:
-            opts["jsruntimes"] = js_runtime
-            opts["js_runtimes"] = js_runtime
-        try:
-            ydl = ytd["module"].YoutubeDL(opts)
-            info = ydl.extract_info(url, download=False)
-            return info if info is not None else {"__error__": {"message": "no info returned"}}
-        except Exception as e:
-            # fallback to CLI path below
-            fallback_err = str(e)
-            use_cli = True
-    else:
-        fallback_err = None
-
-    # CLI fallback
     bin_path = ytd.get("bin")
     if not bin_path:
         return {"__error__": {"message": "yt-dlp not installed (no module or CLI available)"}}
 
-    cmd = [bin_path, "--no-warnings", "--no-playlist", "--skip-download", "--dump-json", url]
+    cmd = [
+        bin_path,
+        "--no-warnings", "--skip-download", "--dump-json",
+        # Limit to a single fast player client to prevent yt-dlp from cycling
+        # through ios/android/web clients on age-gated content, which can take
+        # minutes per video.  android_vr works without a JS runtime and handles
+        # most non-age-gated content; if it fails the timeout will fire.
+        "--extractor-args", "youtube:player_client=android_vr",
+        url,
+    ]
+    if flat:
+        # Insert before url so positional arg stays last.
+        cmd.insert(-1, "--flat-playlist")
     if cookies:
         cmd += ["--cookies", cookies]
     if cookies_from_browser:
         cmd += ["--cookies-from-browser", cookies_from_browser]
     if user_agent:
         cmd += ["--add-header", f"User-Agent: {user_agent}"]
-    # if caller provided js_runtime or we can auto-detect, pass it to CLI
     if js_runtime:
         cmd += ["--js-runtimes", js_runtime]
     else:
@@ -127,7 +146,7 @@ def dump_json(url: str, *, cookies: t.Optional[str] = None, user_agent: t.Option
     if not content:
         # some errors are printed to stderr (e.g. 'Requested format is not available')
         stderr = (p.stderr or "").strip()
-        msg = stderr or fallback_err or "no output from yt-dlp"
+        msg = stderr or "no output from yt-dlp"
         return {"__error__": {"message": msg}}
 
     parsed = _parse_first_json_from_text(content)
@@ -182,7 +201,7 @@ def download_with_format(url: str, format_selector: t.Optional[str], outtmpl: st
         use_cli = True
 
     if ytd["module"] is not None and not use_cli:
-        opts = {"format": format_selector or "bestaudio/best", "outtmpl": outtmpl}
+        opts = {"format": format_selector or "bestaudio/best", "outtmpl": outtmpl, "noplaylist": True, "socket_timeout": 30}
         # attempt to extract audio to mp3 via ffmpeg postprocessor
         opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
         if cookies:
@@ -214,7 +233,7 @@ def download_with_format(url: str, format_selector: t.Optional[str], outtmpl: st
         cmd += ["-f", str(format_selector)]
     else:
         cmd += ["-f", "bestaudio/best"]
-    cmd += ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "192K", "-o", outtmpl, url]
+    cmd += ["--no-playlist", "--extract-audio", "--audio-format", "mp3", "--audio-quality", "192K", "-o", outtmpl, url]
     if cookies:
         cmd += ["--cookies", cookies]
     if cookies_from_browser:

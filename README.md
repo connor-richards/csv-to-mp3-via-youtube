@@ -1,14 +1,14 @@
 # YouTube CSV Downloader
 
-Small helper that reads a CSV exported from a music service (example: Spotify CSV)
-and downloads each track from YouTube as an MP3, sorted into directories by
-playlist name.
+Reads a CSV exported from a music service (e.g. Spotify) and downloads each
+track from YouTube as an MP3.
 
-Why this repo
+What it does
 
-- Converts track lists to local MP3 files grouped by playlist.
-- Resumable: skips already-downloaded files and logs progress & failures.
-- Portable: uses `yt-dlp` + `ffmpeg`; ships a local `tools/` fallback when needed.
+- Searches YouTube for each `Track + Artist` row and downloads the best audio match.
+- Runs preflight checks (duration, estimated file size, view count) before downloading.
+- Extracts a 192 kbps MP3 via ffmpeg.
+- Logs failed/skipped items to `<target>/.ydl_state/failed.log`.
 
 Quick links
 
@@ -19,76 +19,81 @@ Quick links
 
 Requirements
 
-- `yt-dlp` (or `./tools/yt-dlp.exe` on Windows)
-- `ffmpeg` (for audio extraction)
-- `bash` / POSIX shell (Windows: Git Bash, WSL, MSYS, or use Windows Terminal)
+- Python 3.9+
+- `yt-dlp` (install via `pip install yt-dlp` or use the `.venv`)
+- `ffmpeg` (for audio extraction — must be on PATH)
 
 Quick start
 
-1. Do a dry-run to see what would be downloaded without writing files:
+1. Install dependencies into a virtual environment:
 
 ```bash
-python3 src/download_from_csv.py sample_test.csv downloads --dry-run --limit 5
+python3 -m venv .venv && .venv/bin/pip install yt-dlp
 ```
 
-2. Run the real download (will skip existing MP3s and resume automatically):
+2. Dry-run to preview what would be downloaded:
 
 ```bash
-python3 src/download_from_csv.py "My Spotify Library.csv" downloads
+.venv/bin/python src/download_from_csv.py sample_test.csv downloads --dry-run --limit 5
 ```
 
-Logs and resume
+3. Real download run:
 
-- Progress and failures are saved in `<target>/.ydl_state/progress.log`
-  and `<target>/.ydl_state/failed.log`.
-- To resume after an interruption, re-run the same command with the same
-  `<target>` directory: the script will skip already-present MP3 files.
+```bash
+.venv/bin/python src/download_from_csv.py "My Spotify Library.csv" downloads
+```
 
-Local `tools/` fallback
+Or use the wrapper script which activates the venv automatically:
 
-- If `yt-dlp` is not installed system-wide, the script will use `./tools/yt-dlp.exe`
-  (downloaded during testing). Similarly, a portable `ffmpeg` can be placed in
-  `./tools/ffmpeg/...` and the script will pick it up through the PATH.
+```bash
+scripts/run.sh "My Spotify Library.csv" downloads
+```
 
-Legal / Terms
+Output
 
-- This tool downloads content from third-party services. Ensure you have the
-  right to download content and comply with the content provider's Terms of Service.
+- MP3 files are written directly into `<target_dir>`, named by the YouTube video title.
+- Failed and skipped items are recorded in `<target_dir>/.ydl_state/failed.log`.
 
 Cookies & Rate-Limiting
 
-- If `yt-dlp` fails with a message like "Sign in to confirm you’re not a bot",
-  it usually requires authentication cookies to proceed. The script supports
-  passing cookies and other request options through environment variables.
-
-- Environment variables supported:
-  - `YTDLP_COOKIES_FROM_BROWSER=<browser>` — ask `yt-dlp` to import cookies
-    directly from an installed browser (works when running natively on the same OS
-    as the browser; e.g. `chrome`, `edge`, `firefox`).
-  - `YTDLP_COOKIES_FILE=path/to/cookies.txt` — preferred: export a Netscape-format
-    cookies file (use a browser extension like "cookies.txt" / "Get cookies.txt")
-    and point the script to it.
-  - `YTDLP_PROXY` — proxy URL (e.g. `http://127.0.0.1:8080`) to rotate IPs.
-  - `YTDLP_USER_AGENT` — set a realistic browser user-agent string.
-  - `SLEEP_MIN` / `SLEEP_MAX` — jittered sleep interval (seconds) between tracks
-    to reduce request bursts.
-
-Examples
+If yt-dlp fails with "Sign in to confirm you're not a bot", pass a cookies file:
 
 ```bash
-# dry-run with exported cookies file and a 5-12s jitter between tracks
-YTDLP_COOKIES_FILE=cookies.txt SLEEP_MIN=5 SLEEP_MAX=12 \
-  python3 src/download_from_csv.py --dry-run --limit 10 sample_test.csv test_downloads
-
-# native-Windows: let yt-dlp import browser cookies (works when run from Windows)
-YTDLP_COOKIES_FROM_BROWSER=chrome python3 src/download_from_csv.py "My Spotify Library.csv" downloads
+.venv/bin/python src/download_from_csv.py "My Spotify Library.csv" downloads \
+  --cookies cookies.txt \
+  --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 ```
 
-Notes
+To export a cookies file use a browser extension such as "Get cookies.txt LOCALLY"
+and export while logged in to YouTube.
 
-- On WSL the `--cookies-from-browser` option may not work reliably; prefer
-  `YTDLP_COOKIES_FILE` when running under WSL. If you see DPAPI / decrypt errors,
-  export cookies to a file and re-run the script with `YTDLP_COOKIES_FILE`.
-- For very large libraries consider chunking the CSV (use `--limit` in loops),
-  or using the YouTube Data API (requires an API key) to perform searches more
-  politely
+Alternatively, let yt-dlp import cookies directly from an installed browser
+(works best when running natively on the same machine as the browser):
+
+```bash
+.venv/bin/python src/download_from_csv.py "My Spotify Library.csv" downloads \
+  --cookies-from-browser chrome
+```
+
+Note: `--cookies-from-browser` may fail under WSL due to Windows DPAPI key access.
+Prefer a cookies file in that case.
+
+All CLI flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dry-run` | off | Preflight checks only, no downloads |
+| `--limit N` | 0 (all) | Process only the first N rows |
+| `--max-duration SECS` | 600 | Skip videos longer than this |
+| `--max-filesize SIZE` | 30M | Skip if estimated filesize exceeds this |
+| `--min-views N` | 10000 | Skip videos with fewer views |
+| `--cookies PATH` | none | Path to Netscape-format cookies.txt |
+| `--cookies-from-browser BROWSER` | none | Import cookies from browser (chrome, firefox…) |
+| `--user-agent STRING` | none | Custom User-Agent header |
+| `--js-runtimes` | auto | JS runtime for yt-dlp (auto, deno, node, deno:/path) |
+| `--skip-smoke-test` | off | Skip the startup connectivity check |
+
+Legal / Terms
+
+This tool downloads content from third-party services. Ensure you have the
+right to download the content and comply with the provider's Terms of Service.

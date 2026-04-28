@@ -1,12 +1,32 @@
 #!/usr/bin/env python3
-"""Download MP3s from a CSV using yt-dlp with safer preflight checks.
+"""Download MP3s from a Spotify-export CSV file using yt-dlp.
 
-Usage (basic):
-  python3 src/download_from_csv.py sample_test.csv test_downloads --dry-run
+For each CSV row the script:
+  1. Issues a fast flat YouTube search (ytsearch1:) to get a video URL
+     without triggering the yt-dlp player-client loop.
+  2. Fetches full metadata for that specific URL (one player client,
+     hard timeout via subprocess).
+  3. Runs preflight checks: duration, estimated filesize, view count.
+  4. Downloads the video and extracts a 192 kbps MP3 via ffmpeg.
 
-This script performs a metadata preflight (duration, filesize, views)
-and prefers to select a concrete `format_id` from yt-dlp's `formats` list
-for robust downloads.
+Files are written directly into <target_dir> named by YouTube video title.
+Failed/skipped items are logged to <target_dir>/.ydl_state/failed.log.
+
+Basic usage:
+  python3 src/download_from_csv.py sample_test.csv downloads --dry-run --limit 5
+  python3 src/download_from_csv.py "My Spotify Library.csv" downloads
+
+All options:
+  --dry-run               preflight checks only, no downloads
+  --limit N               process only the first N rows (0 = all)
+  --max-duration SECS     skip videos longer than this (default: 600)
+  --max-filesize SIZE     skip if estimated file size exceeds this (default: 30M)
+  --min-views N           skip videos with fewer views (default: 10000)
+  --cookies PATH          path to a Netscape-format cookies.txt
+  --cookies-from-browser  browser name to import cookies from (e.g. chrome)
+  --user-agent STRING     custom User-Agent header
+  --js-runtimes           JS runtime for yt-dlp (auto|deno|node|deno:/path)
+  --skip-smoke-test       skip the connectivity smoke test at startup
 """
 from __future__ import annotations
 
@@ -104,6 +124,60 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 3
         print("Smoke OK")
 
+    def is_channel_url(url: str) -> bool:
+        """Return True if url points to a channel or playlist, not a specific video."""
+        if not isinstance(url, str):
+            return False
+        for pat in ("/channel/", "/c/", "/@", "/user/", "/playlist?", "/videos", "/shorts"):
+            if pat in url:
+                return True
+        return False
+
+    def is_video_entry(e: dict) -> bool:
+        if not isinstance(e, dict):
+            return False
+        url = e.get("webpage_url") or e.get("url") or ""
+        if is_channel_url(url):
+            return False  # channels are not individual videos
+        if e.get("formats"):
+            return True
+        if e.get("duration"):
+            return True
+        if isinstance(url, str) and "watch" in url:
+            return True
+        return False
+
+    def pick_best_video(info: dict) -> t.Optional[dict]:
+        # Prefer a direct video-like entry. Search entries list for the
+        # first item that looks like a video (has formats/duration/watch URL).
+        if not isinstance(info, dict):
+            return None
+        entries = []
+        if info.get("entries"):
+            if isinstance(info.get("entries"), list):
+                entries = info.get("entries")
+            else:
+                entries = [info.get("entries")]
+
+        for e in entries:
+            if is_video_entry(e):
+                return e
+
+        # sometimes the top-level info is itself a video
+        if is_video_entry(info):
+            return info
+
+        # look deeper in nested entries
+        for e in entries:
+            if isinstance(e, dict) and e.get("entries"):
+                nested = e.get("entries")
+                if isinstance(nested, list):
+                    for ne in nested:
+                        if is_video_entry(ne):
+                            return ne
+
+        return None
+
     processed = 0
     with open(csvfile, newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
@@ -113,8 +187,46 @@ def main(argv: Optional[list[str]] = None) -> int:
             processed += 1
             query = build_query(row)
             print(f"\n[{processed}] Query: {query}")
+            # Step 1: flat search — get video URL quickly without fetching full metadata.
+            # Using --flat-playlist means yt-dlp returns just id/title/url for each
+            # search result without running the player client to get formats.
             search = f"ytsearch1:{query}"
-            info = dump_json(search, cookies=args.cookies, cookies_from_browser=args.cookies_from_browser, user_agent=args.user_agent, js_runtime=js_runtime)
+            flat_info = dump_json(search, cookies=args.cookies, cookies_from_browser=args.cookies_from_browser, user_agent=args.user_agent, js_runtime=js_runtime, timeout=30, flat=True)
+            if flat_info.get("__error__"):
+                reason = flat_info.get("__error__").get("message")
+                print(f"  Search failed: {reason}")
+                with open(failed_log, "a", encoding="utf-8") as ff:
+                    ff.write(f"{query}\tERROR\t{reason}\n")
+                continue
+
+            # Pick the best video URL from flat search results
+            flat_entry = pick_best_video(flat_info)
+
+            # If flat search returned a channel/playlist URL, retry with refined query
+            if flat_entry is None or is_channel_url(flat_entry.get("webpage_url") or flat_entry.get("url") or ""):
+                if flat_entry is not None:
+                    print(f"  Search returned a channel/playlist URL; retrying with refined query...")
+                else:
+                    print("  No immediate video result; trying refined query...")
+                refined = f"{query} official audio"
+                flat_info2 = dump_json(f"ytsearch5:{refined}", cookies=args.cookies, cookies_from_browser=args.cookies_from_browser, user_agent=args.user_agent, js_runtime=js_runtime, timeout=30, flat=True)
+                flat_entry = None
+                if not flat_info2.get("__error__"):
+                    for e in ([pick_best_video(flat_info2)] + list(flat_info2.get("entries") or [])):
+                        if e and is_video_entry(e) and not is_channel_url(e.get("webpage_url") or e.get("url") or ""):
+                            flat_entry = e
+                            break
+
+            if not flat_entry:
+                print("  No result from search")
+                with open(failed_log, "a", encoding="utf-8") as ff:
+                    ff.write(f"{query}\tNO_RESULT\n")
+                continue
+
+            # Step 2: fetch full metadata for the specific video URL (fast — direct URL,
+            # no search overhead, one player client only).
+            video_url = flat_entry.get("webpage_url") or flat_entry.get("url")
+            info = dump_json(video_url, cookies=args.cookies, cookies_from_browser=args.cookies_from_browser, user_agent=args.user_agent, js_runtime=js_runtime, timeout=60)
             if info.get("__error__"):
                 reason = info.get("__error__").get("message")
                 print(f"  Preflight failure (yt-dlp error): {reason}")
@@ -122,13 +234,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     ff.write(f"{query}\tERROR\t{reason}\n")
                 continue
 
-            # ytsearch1 returns a dict with 'entries' (list)
-            entry = None
-            if isinstance(info, dict) and info.get("entries"):
-                if isinstance(info.get("entries"), list) and info.get("entries"):
-                    entry = info.get("entries")[0]
-            if entry is None and isinstance(info, dict):
-                entry = info
+            entry = pick_best_video(info) or info
 
             if not entry:
                 print("  No result from search")
