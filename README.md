@@ -12,7 +12,7 @@ Why this repo
 
 Quick links
 
-- Script: [youtube-download-from-csv.sh](youtube-download-from-csv.sh)
+- CLI: [src/download_from_csv.py](src/download_from_csv.py)
 - Installation instructions: [docs/INSTALL.md](docs/INSTALL.md)
 - Usage guide and examples: [docs/USAGE.md](docs/USAGE.md)
 - Architecture notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
@@ -28,13 +28,13 @@ Quick start
 1. Do a dry-run to see what would be downloaded without writing files:
 
 ```bash
-bash youtube-download-from-csv.sh --dry-run --limit 5 "My Spotify Library.csv" downloads
+python3 src/download_from_csv.py sample_test.csv downloads --dry-run --limit 5
 ```
 
 2. Run the real download (will skip existing MP3s and resume automatically):
 
 ```bash
-bash youtube-download-from-csv.sh "My Spotify Library.csv" downloads
+python3 src/download_from_csv.py "My Spotify Library.csv" downloads
 ```
 
 Logs and resume
@@ -78,10 +78,10 @@ Examples
 ```bash
 # dry-run with exported cookies file and a 5-12s jitter between tracks
 YTDLP_COOKIES_FILE=cookies.txt SLEEP_MIN=5 SLEEP_MAX=12 \
-  bash youtube-download-from-csv.sh --dry-run --limit 10 "My Spotify Library.csv" test_downloads
+  python3 src/download_from_csv.py --dry-run --limit 10 sample_test.csv test_downloads
 
 # native-Windows: let yt-dlp import browser cookies (works when run from Windows)
-YTDLP_COOKIES_FROM_BROWSER=chrome bash youtube-download-from-csv.sh "My Spotify Library.csv" downloads
+YTDLP_COOKIES_FROM_BROWSER=chrome python3 src/download_from_csv.py "My Spotify Library.csv" downloads
 ```
 
 Notes
@@ -91,4 +91,4 @@ Notes
   export cookies to a file and re-run the script with `YTDLP_COOKIES_FILE`.
 - For very large libraries consider chunking the CSV (use `--limit` in loops),
   or using the YouTube Data API (requires an API key) to perform searches more
-  politely; I can add an API-mode if you'd like.
+  politely

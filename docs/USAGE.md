@@ -1,6 +1,6 @@
 # Usage
 
-Script: `youtube-download-from-csv.sh`
+CLI: `src/download_from_csv.py`
 
 Options
 
@@ -13,13 +13,13 @@ Examples
 - Dry-run 5 tracks:
 
 ```bash
-bash youtube-download-from-csv.sh --dry-run --limit 5 "My Spotify Library.csv" downloads
+python3 src/download_from_csv.py sample_test.csv downloads --dry-run --limit 5
 ```
 
 - Real run (download everything and sort into playlist folders):
 
 ```bash
-bash youtube-download-from-csv.sh "My Spotify Library.csv" downloads
+python3 src/download_from_csv.py "My Spotify Library.csv" downloads
 ```
 
 Behavior notes
@@ -38,3 +38,18 @@ Tips
   or tuning the search query in the script.
 - If you want to keep the original audio file produced by `yt-dlp`, run
   `yt-dlp` with `-k` (the script deletes the original by default).
+
+Additional useful options for the Python downloader (`src/download_from_csv.py`):
+
+- `--cookies PATH` : pass a `cookies.txt` file exported from your browser.
+- `--cookies-from-browser BROWSER` : ask `yt-dlp` to load cookies directly from a browser profile (e.g. `chrome`, `firefox`).
+- `--user-agent STRING` : set a custom User-Agent header for requests.
+- `--js-runtimes` : supply a JavaScript runtime to yt-dlp (e.g. `node`, `deno`) or use `auto` to attempt detection.
+
+These help when videos are age-restricted, geo-restricted, or when yt-dlp requires a JS runtime to extract richer formats.
+
+To run with a local virtualenv (if present):
+
+```bash
+scripts/run.sh sample_test.csv downloads --dry-run
+```
