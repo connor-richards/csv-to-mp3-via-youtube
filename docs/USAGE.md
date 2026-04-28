@@ -44,6 +44,79 @@ scripts/run.sh "My Spotify Library.csv" downloads
 | `--user-agent STRING` | none | Custom User-Agent header sent with requests |
 | `--js-runtimes` | auto | JS runtime for yt-dlp format extraction (`auto`, `deno`, `node`, `deno:/path`) |
 | `--skip-smoke-test` | off | Skip the startup connectivity check |
+| `--retry` | off | Retry entries that previously failed (ERROR) |
+| `--retry-skipped` | off | Retry entries that were previously skipped (preflight failed) |
+| `--retry-all` | off | Retry all previously attempted entries (both failed and skipped) |
+
+## Resume & Retry Workflow
+
+### How progress tracking works
+
+Each run creates or appends to `<target>/.ydl_state/progress.log` with the following format:
+
+```
+query<TAB>status<TAB>detail<TAB>ISO8601_timestamp
+```
+
+Example:
+
+```
+Two Door Cinema ClubSUCCESSdownloaded2026-04-28T12:30:45.123456
+Cardinal BloomSKIPPEDviews_too_low2026-04-28T12:31:22.654321
+Oliver TreeFAILEDmetadata_error:Connection timeout2026-04-28T12:32:10.987654
+```
+
+**Status codes:**
+- `SUCCESS` — download completed
+- `SKIPPED` — preflight check failed (duration, filesize, views)
+- `FAILED` — search/metadata/download error
+- `DRYRUN` — dry-run mode processed this entry
+
+### Default resume behavior
+
+By default, already-processed entries are skipped on reruns:
+
+```bash
+# First run
+.venv/bin/python src/download_from_csv.py "My Spotify Library.csv" downloads
+# Processes 1000 rows...
+
+# Rerun with updated CSV (new rows appended)
+.venv/bin/python src/download_from_csv.py "My Spotify Library.csv" downloads
+# Skips 1000 already-processed rows, processes only new entries
+```
+
+### Retry modes
+
+**Retry failed entries only:**
+
+```bash
+.venv/bin/python src/download_from_csv.py "My Spotify Library.csv" downloads --retry
+# Processes only entries with status=FAILED
+# Skips SUCCESS and SKIPPED entries
+```
+
+Use case: After fixing cookies, network issues, or updating yt-dlp.
+
+**Retry skipped entries only:**
+
+```bash
+.venv/bin/python src/download_from_csv.py "My Spotify Library.csv" downloads --retry-skipped
+# Processes only entries with status=SKIPPED
+# Skips SUCCESS and FAILED entries
+```
+
+Use case: After lowering `--min-views` or increasing `--max-filesize` to allow previously-skipped entries.
+
+**Retry everything:**
+
+```bash
+.venv/bin/python src/download_from_csv.py "My Spotify Library.csv" downloads --retry-all
+# Reprocesses all entries in progress.log
+# Useful to reset or change all outcomes
+```
+
+Use case: Complete rebuild after changing preflight thresholds or fixing critical bugs.
 
 ## Behavior
 
@@ -85,19 +158,12 @@ metadata, selects the best available audio `format_id`, and retries.
 MP3 files are written directly into `<target_dir>`, named by the YouTube video
 title (e.g. `TWO DOOR CINEMA CLUB | WHAT YOU KNOW.mp3`).
 
-**Failure log**
+**Progress & failure logs**
 
-Items that fail or are skipped are appended to `<target_dir>/.ydl_state/failed.log`
-with a tab-separated `query<TAB>reason<TAB>detail` format. Reason codes:
+- `progress.log` — complete record of all processed queries (status, detail, timestamp)
+- `failed.log` — legacy log of failed/skipped items (query, reason, detail)
 
-| Code | Meaning |
-|------|---------|
-| `ERROR` | yt-dlp returned an error during search or metadata fetch |
-| `SKIPPED` | Preflight check failed (see detail: `duration_exceeded`, `views_too_low`, etc.) |
-| `NO_RESULT` | Search returned no usable video |
-| `DOWNLOAD_FAILED` | yt-dlp download step failed |
-| `DOWNLOAD_FAILED_RETRY` | Download failed even after format-id retry |
-| `NO_AUDIO_FORMATS` | No audio-capable format found to retry with |
+Both are created in `<target>/.ydl_state/`.
 
 **Startup smoke test**
 
@@ -124,3 +190,5 @@ instead.
   explicitly if auto-detection picks up an unexpected runtime.
 - Rate-limit errors ("This content isn't available, try again later") are a
   temporary YouTube-side block from too many requests. Wait an hour and rerun.
+- Use `--retry-all` to reprocess everything after making significant changes
+  to preflight thresholds or fixing bugs.

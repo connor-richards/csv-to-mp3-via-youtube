@@ -8,6 +8,7 @@ What it does
 - Searches YouTube for each `Track + Artist` row and downloads the best audio match.
 - Runs preflight checks (duration, estimated file size, view count) before downloading.
 - Extracts a 192 kbps MP3 via ffmpeg.
+- **Tracks progress** so reruns skip already-processed entries and can retry failed ones.
 - Logs failed/skipped items to `<target>/.ydl_state/failed.log`.
 
 Quick links
@@ -49,10 +50,36 @@ Or use the wrapper script which activates the venv automatically:
 scripts/run.sh "My Spotify Library.csv" downloads
 ```
 
+Resume & Retry
+
+Progress is automatically tracked in `<target>/.ydl_state/progress.log`. On reruns:
+
+- **By default**: already-processed entries are skipped
+- **`--retry`**: reprocess entries that failed (ERROR)
+- **`--retry-skipped`**: reprocess entries that were skipped (preflight failed)
+- **`--retry-all`**: reprocess all previously attempted entries
+
+Examples:
+
+```bash
+# First run
+.venv/bin/python src/download_from_csv.py "My Spotify Library.csv" downloads
+
+# Resume — add new entries from updated CSV without re-downloading
+.venv/bin/python src/download_from_csv.py "My Spotify Library.csv" downloads
+
+# Retry failed entries (e.g. after fixing cookies or network issues)
+.venv/bin/python src/download_from_csv.py "My Spotify Library.csv" downloads --retry
+
+# Retry everything (e.g. if preflight thresholds changed)
+.venv/bin/python src/download_from_csv.py "My Spotify Library.csv" downloads --retry-all
+```
+
 Output
 
 - MP3 files are written directly into `<target_dir>`, named by the YouTube video title.
 - Failed and skipped items are recorded in `<target_dir>/.ydl_state/failed.log`.
+- Progress is tracked in `<target_dir>/.ydl_state/progress.log` (query, status, detail, timestamp).
 
 Cookies & Rate-Limiting
 
@@ -92,6 +119,9 @@ All CLI flags
 | `--user-agent STRING` | none | Custom User-Agent header |
 | `--js-runtimes` | auto | JS runtime for yt-dlp (auto, deno, node, deno:/path) |
 | `--skip-smoke-test` | off | Skip the startup connectivity check |
+| `--retry` | off | Retry previously failed entries |
+| `--retry-skipped` | off | Retry previously skipped entries |
+| `--retry-all` | off | Retry all previously attempted entries |
 
 Legal / Terms
 

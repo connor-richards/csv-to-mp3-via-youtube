@@ -1,6 +1,7 @@
 # Ignore downloads, tools, and local artifacts
 downloads/
 test_downloads/
+test_resume/
 tools/
 *.log
 *.bak

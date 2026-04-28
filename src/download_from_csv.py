@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download MP3s from a Spotify-export CSV file using yt-dlp.
+"""Download MP3s from a Spotify-export CSV file using yt-dlp, with resumable progress.
 
 For each CSV row the script:
   1. Issues a fast flat YouTube search (ytsearch1:) to get a video URL
@@ -10,23 +10,16 @@ For each CSV row the script:
   4. Downloads the video and extracts a 192 kbps MP3 via ffmpeg.
 
 Files are written directly into <target_dir> named by YouTube video title.
-Failed/skipped items are logged to <target_dir>/.ydl_state/failed.log.
+All outcomes logged to <target_dir>/.ydl_state/progress.log (query|status|detail|timestamp).
 
-Basic usage:
+Resume & Retry:
+  - By default, already-processed entries are skipped on reruns.
+  - Use --retry to reprocess failed entries, --retry-skipped for skipped, --retry-all for both.
+
+Examples:
   python3 src/download_from_csv.py sample_test.csv downloads --dry-run --limit 5
   python3 src/download_from_csv.py "My Spotify Library.csv" downloads
-
-All options:
-  --dry-run               preflight checks only, no downloads
-  --limit N               process only the first N rows (0 = all)
-  --max-duration SECS     skip videos longer than this (default: 600)
-  --max-filesize SIZE     skip if estimated file size exceeds this (default: 30M)
-  --min-views N           skip videos with fewer views (default: 10000)
-  --cookies PATH          path to a Netscape-format cookies.txt
-  --cookies-from-browser  browser name to import cookies from (e.g. chrome)
-  --user-agent STRING     custom User-Agent header
-  --js-runtimes           JS runtime for yt-dlp (auto|deno|node|deno:/path)
-  --skip-smoke-test       skip the connectivity smoke test at startup
+  python3 src/download_from_csv.py "My Spotify Library.csv" downloads --retry
 """
 from __future__ import annotations
 
@@ -35,6 +28,7 @@ import csv
 import os
 import sys
 import time
+from datetime import datetime
 from typing import Optional
 
 from ydl_helpers import (
@@ -60,6 +54,38 @@ def build_query(row: dict) -> str:
     return q or track or artist
 
 
+def load_progress_log(progress_log_path: str) -> dict:
+    """Load progress.log into a dict: query -> (status, detail, timestamp).
+    
+    Status is one of: SUCCESS, SKIPPED, FAILED.
+    """
+    progress = {}
+    if not os.path.isfile(progress_log_path):
+        return progress
+    try:
+        with open(progress_log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    query, status = parts[0], parts[1]
+                    detail = parts[2] if len(parts) > 2 else ""
+                    ts = parts[3] if len(parts) > 3 else ""
+                    progress[query] = (status, detail, ts)
+    except Exception as e:
+        print(f"Warning: could not read progress log: {e}")
+    return progress
+
+
+def write_progress_entry(path: str, query: str, status: str, detail: str = "") -> None:
+    """Append an entry to progress.log: query<TAB>status<TAB>detail<TAB>timestamp."""
+    ts = datetime.now().isoformat()
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{query}\t{status}\t{detail}\t{ts}\n")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Download MP3s from CSV rows (yt-dlp)")
     p.add_argument("csvfile")
@@ -74,6 +100,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--js-runtimes", default="auto", help="JS runtime to pass to yt-dlp (auto|deno|node|deno:/path)")
     p.add_argument("--cookies-from-browser", default=None, help="Browser name for --cookies-from-browser (e.g. chrome, firefox)")
     p.add_argument("--skip-smoke-test", action="store_true")
+    p.add_argument("--retry", action="store_true", help="Retry previously failed (ERROR) entries")
+    p.add_argument("--retry-skipped", action="store_true", help="Retry previously skipped entries")
+    p.add_argument("--retry-all", action="store_true", help="Retry all previously attempted entries (both failed and skipped)")
     args = p.parse_args(argv)
 
     csvfile = args.csvfile
@@ -92,6 +121,28 @@ def main(argv: Optional[list[str]] = None) -> int:
     state_dir = os.path.join(target_dir, ".ydl_state")
     safe_mkdir(state_dir)
     failed_log = os.path.join(state_dir, "failed.log")
+    progress_log = os.path.join(state_dir, "progress.log")
+    
+    # Load existing progress
+    progress = load_progress_log(progress_log)
+    already_processed = set(progress.keys())
+    
+    # Determine which queries to skip
+    skip_queries = set()
+    if args.retry_all:
+        skip_queries = set()  # process everything
+    elif args.retry:
+        # Skip SUCCESS and SKIPPED, but reprocess FAILED
+        skip_queries = {q for q, (s, _, _) in progress.items() if s in ("SUCCESS", "SKIPPED")}
+    elif args.retry_skipped:
+        # Skip SUCCESS and FAILED, but reprocess SKIPPED
+        skip_queries = {q for q, (s, _, _) in progress.items() if s in ("SUCCESS", "FAILED")}
+    else:
+        # Default: skip all previously processed
+        skip_queries = already_processed
+    
+    if skip_queries:
+        print(f"Skipping {len(skip_queries)} already-processed entries (use --retry* flags to reprocess)")
 
     ytd = detect_ytdlp()
     print("Detected yt-dlp module:" , bool(ytd.get("module")), "CLI:", ytd.get("bin"))
@@ -186,6 +237,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                 break
             processed += 1
             query = build_query(row)
+            
+            # Skip if already processed and not retrying
+            if query in skip_queries:
+                print(f"\n[{processed}] Query: {query} [SKIPPED: already processed]")
+                continue
+            
             print(f"\n[{processed}] Query: {query}")
             # Step 1: flat search — get video URL quickly without fetching full metadata.
             # Using --flat-playlist means yt-dlp returns just id/title/url for each
@@ -195,6 +252,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             if flat_info.get("__error__"):
                 reason = flat_info.get("__error__").get("message")
                 print(f"  Search failed: {reason}")
+                write_progress_entry(progress_log, query, "FAILED", f"search_error:{reason[:100]}")
                 with open(failed_log, "a", encoding="utf-8") as ff:
                     ff.write(f"{query}\tERROR\t{reason}\n")
                 continue
@@ -219,6 +277,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
             if not flat_entry:
                 print("  No result from search")
+                write_progress_entry(progress_log, query, "FAILED", "no_search_result")
                 with open(failed_log, "a", encoding="utf-8") as ff:
                     ff.write(f"{query}\tNO_RESULT\n")
                 continue
@@ -230,6 +289,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             if info.get("__error__"):
                 reason = info.get("__error__").get("message")
                 print(f"  Preflight failure (yt-dlp error): {reason}")
+                write_progress_entry(progress_log, query, "FAILED", f"metadata_error:{reason[:100]}")
                 with open(failed_log, "a", encoding="utf-8") as ff:
                     ff.write(f"{query}\tERROR\t{reason}\n")
                 continue
@@ -238,6 +298,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
             if not entry:
                 print("  No result from search")
+                write_progress_entry(progress_log, query, "FAILED", "no_result_after_metadata")
                 with open(failed_log, "a", encoding="utf-8") as ff:
                     ff.write(f"{query}\tNO_RESULT\n")
                 continue
@@ -245,6 +306,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             ok, reason = preflight_check(entry, max_duration=max_duration, max_filesize=max_filesize, min_views=min_views)
             if not ok:
                 print(f"  Skipping: {reason}")
+                write_progress_entry(progress_log, query, "SKIPPED", reason)
                 with open(failed_log, "a", encoding="utf-8") as ff:
                     ff.write(f"{query}\tSKIPPED\t{reason}\n")
                 continue
@@ -255,6 +317,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             webpage = entry.get("webpage_url") or entry.get("url") or None
             if not webpage:
                 print("  No webpage URL available for download. Skipping.")
+                write_progress_entry(progress_log, query, "FAILED", "no_webpage_url")
                 with open(failed_log, "a", encoding="utf-8") as ff:
                     ff.write(f"{query}\tNO_WEBPAGE\n")
                 continue
@@ -263,6 +326,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
             if dry_run:
                 print(f"  Dry-run: would download {webpage} using format {chosen}")
+                write_progress_entry(progress_log, query, "DRYRUN", "dry_run_mode")
                 continue
 
             print(f"  Downloading {webpage} using format {chosen} ...")
@@ -286,6 +350,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     if meta.get("__error__"):
                         fallback_reason = meta.get("__error__").get("message")
                         print(f"  Could not fetch metadata for fallback: {fallback_reason}")
+                        write_progress_entry(progress_log, query, "FAILED", f"download_format_error:{msg[:80]}")
                         with open(failed_log, "a", encoding="utf-8") as ff:
                             ff.write(f"{query}\tDOWNLOAD_FAILED\t{msg[:200]} | fallback_meta_error:{(fallback_reason or '')[:200]}\n")
                     else:
@@ -295,19 +360,24 @@ def main(argv: Optional[list[str]] = None) -> int:
                             r2 = download_with_format(webpage, fmt2, outtmpl, cookies=args.cookies, cookies_from_browser=args.cookies_from_browser, user_agent=args.user_agent, js_runtime=js_runtime)
                             if r2.get("success"):
                                 print(f"  Download succeeded with format id {fmt2}")
+                                write_progress_entry(progress_log, query, "SUCCESS", f"retry_with_format:{fmt2}")
                             else:
                                 print(f"  Retry failed: {r2.get('message')}")
+                                write_progress_entry(progress_log, query, "FAILED", f"download_retry_failed:{r2.get('message')[:80]}")
                                 with open(failed_log, "a", encoding="utf-8") as ff:
                                     ff.write(f"{query}\tDOWNLOAD_FAILED_RETRY\t{(r2.get('message') or '')[:200]}\n")
                         else:
                             print("  No audio-capable format id found to retry.")
+                            write_progress_entry(progress_log, query, "FAILED", "no_audio_formats")
                             with open(failed_log, "a", encoding="utf-8") as ff:
                                 ff.write(f"{query}\tNO_AUDIO_FORMATS\n")
                 else:
+                    write_progress_entry(progress_log, query, "FAILED", f"download_failed:{msg[:80]}")
                     with open(failed_log, "a", encoding="utf-8") as ff:
                         ff.write(f"{query}\tDOWNLOAD_FAILED\t{msg[:200]}\n")
             else:
                 print("  Download succeeded")
+                write_progress_entry(progress_log, query, "SUCCESS", "downloaded")
 
             # be polite to services
             time.sleep(0.5)
