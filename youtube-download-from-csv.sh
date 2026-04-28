@@ -51,8 +51,100 @@ Options:
   --enable-sleep  : enable randomized sleep between tracks (uses SLEEP_MIN/SLEEP_MAX env vars)
 
 Requires: yt-dlp, python3, ffmpeg (ffmpeg only needed for real downloads)
+ 
+Environment variables:
+  MAX_DURATION    : maximum allowed duration (seconds) for a candidate video (default: 600)
+  MAX_FILESIZE    : maximum allowed estimated filesize (e.g. 30M). Used with yt-dlp --max-filesize as a fallback.
+  MIN_VIEWS       : minimum allowed view count (e.g. 10000). Used to prefer/popular results.
 USAGE
   exit 1
+}
+
+# Preflight check using yt-dlp metadata (JSON) to skip unreasonably long/large candidates.
+# Returns 0 when OK, 2 when duration exceeded, 3 when filesize exceeded, 4 when view count too low.
+preflight_check() {
+  local info_json_file="$1"
+  if [ -z "$info_json_file" ] || [ ! -s "$info_json_file" ]; then
+  return 0
+  fi
+  if [ "${HAVE_PYTHON:-0}" -eq 0 ]; then
+  # Can't do deep checks without Python; rely on --max-filesize during download
+  return 0
+  fi
+  "$PY_EXEC" - "$info_json_file" "$MAX_DURATION" "$MAX_FILESIZE" "$MIN_VIEWS" <<'PY'
+import sys, json, re
+fn=sys.argv[1]
+try:
+  maxdur=int(sys.argv[2]) if sys.argv[2] else 0
+except:
+  maxdur=0
+maxfs_str=sys.argv[3] if len(sys.argv)>3 else ''
+min_views_str=sys.argv[4] if len(sys.argv)>4 else ''
+
+def parse_size(s):
+  if not s: return None
+  m=re.match(r'^(\d+(?:\.\d+)?)([KkMmGg]?)$', s)
+  if not m:
+    try:
+      return int(s)
+    except:
+      return None
+  val=float(m.group(1)); unit=m.group(2).upper()
+  if unit=='K': return int(val*1024)
+  if unit=='M': return int(val*1024*1024)
+  if unit=='G': return int(val*1024*1024*1024)
+  return int(val)
+
+def parse_count(s):
+  if not s: return None
+  m=re.match(r'^(\d+(?:\.\d+)?)([KkMmGg]?)$', s)
+  if not m:
+    try:
+      return int(s)
+    except:
+      return None
+  val=float(m.group(1)); unit=m.group(2).upper()
+  if unit=='K': return int(val*1000)
+  if unit=='M': return int(val*1000*1000)
+  if unit=='G': return int(val*1000*1000*1000)
+  return int(val)
+
+maxfs=parse_size(maxfs_str)
+min_views=parse_count(min_views_str) if min_views_str else None
+try:
+  with open(fn,'r') as fh:
+    data=json.load(fh)
+except Exception:
+  sys.exit(0)
+duration = data.get('duration') or 0
+if maxdur and duration and duration > maxdur:
+  print('duration_exceeded')
+  sys.exit(2)
+formats = data.get('formats') or []
+bestaudio = None
+for f in formats:
+  if f.get('vcodec') in (None,'none','') and f.get('acodec') not in (None,'none',''):
+    if bestaudio is None or (f.get('abr') or 0) > (bestaudio.get('abr') or 0):
+      bestaudio = f
+if bestaudio is None and formats:
+  bestaudio = sorted(formats, key=lambda x: (x.get('abr') or x.get('tbr') or 0), reverse=True)[0]
+size = None
+if bestaudio:
+  size = bestaudio.get('filesize') or bestaudio.get('filesize_approx')
+if not size:
+  size = data.get('filesize') or data.get('filesize_approx')
+if not size and bestaudio and bestaudio.get('abr') and duration:
+  try:
+    abr = float(bestaudio.get('abr'))
+    size = int((abr * 1000.0 / 8.0) * duration)
+  except Exception:
+    size = None
+if size and maxfs and size > maxfs:
+  print('filesize_exceeded')
+  sys.exit(3)
+sys.exit(0)
+PY
+  return $?
 }
 
 # Parse optional flags
@@ -191,6 +283,41 @@ fi
 SLEEP_MIN=${SLEEP_MIN:-1}
 SLEEP_MAX=${SLEEP_MAX:-3}
 
+# Safety thresholds (can be overridden via environment variables)
+# MAX_DURATION: skip candidates with duration (seconds) greater than this
+# MAX_FILESIZE: human-readable size (e.g. 30M). Used as a yt-dlp --max-filesize fallback.
+MAX_DURATION=${MAX_DURATION:-600}
+MAX_FILESIZE=${MAX_FILESIZE:-30M}
+# MIN_VIEWS: minimum view count to prefer popular videos (can use K/M suffixes)
+MIN_VIEWS=${MIN_VIEWS:-10000}
+
+# Convert human-friendly counts (10K, 1.2M) into integers for --match-filter
+parse_count_bash() {
+  local s="${1:-}"
+  [ -z "$s" ] && printf "" && return
+  if printf '%s' "$s" | grep -Eq '^[0-9]+$'; then
+    printf '%s' "$s"
+    return
+  fi
+  if printf '%s' "$s" | grep -Eq '^[0-9]+(\.[0-9]+)?[kKmMgG]$'; then
+    local num; num=$(printf '%s' "$s" | sed -E 's/^([0-9]+(\.[0-9]+)?)[kKmMgG]$/\1/')
+    local unit; unit=$(printf '%s' "$s" | sed -E 's/^[0-9]+(\.[0-9]+)?([kKmMgG])$/\2/' | tr '[:lower:]' '[:upper:]')
+    local mult=1
+    case "$unit" in
+      K) mult=1000 ;; 
+      M) mult=1000000 ;; 
+      G) mult=1000000000 ;; 
+    esac
+    awk -v n="$num" -v m="$mult" 'BEGIN{printf("%d", n*m)}'
+    return
+  fi
+  # fallback: take leading digits
+  printf '%s' "$s" | sed -E 's/^([0-9]+).*/\1/'
+}
+
+# Numeric form for match-filter (empty if parse failed)
+MIN_VIEWS_NUM=$(parse_count_bash "${MIN_VIEWS:-}")
+
 # Optional proxy list and user-agent list files (one entry per line)
 # Set via env: YTDLP_PROXY_FILE, YTDLP_USER_AGENTS_FILE
 PROXIES=()
@@ -234,6 +361,14 @@ build_ytdlp_args() {
     if [ -n "${count:-}" ]; then base2=$count; fi
     local idx2=$(( (base2 + attempt_idx - 1) % ${#UAS[@]} ))
     CURRENT_YTDLP_ARGS+=(--add-header "User-Agent: ${UAS[$idx2]}")
+  fi
+  # enforce max filesize (user-overridable)
+  if [ -n "${MAX_FILESIZE:-}" ]; then
+    CURRENT_YTDLP_ARGS+=(--max-filesize "${MAX_FILESIZE}")
+  fi
+  # prefer videos with at least MIN_VIEWS_NUM views (server-side filter when supported)
+  if [ -n "${MIN_VIEWS_NUM:-}" ]; then
+    CURRENT_YTDLP_ARGS+=(--match-filter "view_count >= ${MIN_VIEWS_NUM}")
   fi
 }
 
@@ -380,6 +515,30 @@ while IFS=$'\t' read -r playlist track artist || [ -n "$track" ]; do
         for q in "${queries[@]}"; do
           echo "    Query: $q"
           build_ytdlp_args "$attempt"
+          # preflight: inspect metadata to skip long/large candidates
+          tmp_info=$(mktemp)
+          $YTDLP_BIN --no-warnings --no-playlist --skip-download --dump-json "${CURRENT_YTDLP_ARGS[@]}" "ytsearch1:${q}" > "$tmp_info" 2>/dev/null || true
+          if [ -s "$tmp_info" ]; then
+            preflight_check "$tmp_info"
+            rc_pf=$?
+            if [ "$rc_pf" -eq 2 ]; then
+              ce_warn "    Dry-run: candidate skipped (duration > ${MAX_DURATION}s)"
+              echo "$playlist|$track|$artist|skipped_duration" >> "$PROGRESS_LOG"
+              rm -f "$tmp_info"
+              continue
+                      elif [ "$rc_pf" -eq 3 ]; then
+              ce_warn "    Dry-run: candidate skipped (filesize > ${MAX_FILESIZE})"
+              echo "$playlist|$track|$artist|skipped_filesize" >> "$PROGRESS_LOG"
+              rm -f "$tmp_info"
+              continue
+                      elif [ "$rc_pf" -eq 4 ]; then
+                        ce_warn "    Dry-run: candidate skipped (views < ${MIN_VIEWS})"
+                        echo "$playlist|$track|$artist|skipped_views" >> "$PROGRESS_LOG"
+                        rm -f "$tmp_info"
+                        continue
+            fi
+          fi
+          rm -f "$tmp_info"
           tmp_err=$(mktemp)
           fn=$($YTDLP_BIN --no-warnings --no-playlist --get-filename -o "%(title)s.%(ext)s" "${CURRENT_YTDLP_ARGS[@]}" "ytsearch1:${q}" 2> "$tmp_err" | head -n1 || true)
           err=$(cat "$tmp_err" || true)
@@ -412,6 +571,30 @@ while IFS=$'\t' read -r playlist track artist || [ -n "$track" ]; do
       for q in "${queries[@]}"; do
         echo "    Query: $q"
         build_ytdlp_args "$attempt"
+        # preflight: inspect metadata to skip long/large candidates
+        tmp_info=$(mktemp)
+        $YTDLP_BIN --no-warnings --no-playlist --skip-download --dump-json "${CURRENT_YTDLP_ARGS[@]}" "ytsearch1:${q}" > "$tmp_info" 2>/dev/null || true
+        if [ -s "$tmp_info" ]; then
+          preflight_check "$tmp_info"
+          rc_pf=$?
+          if [ "$rc_pf" -eq 2 ]; then
+            ce_warn "    Candidate skipped (duration > ${MAX_DURATION}s)"
+            echo "$playlist|$track|$artist|skipped_duration" >> "$PROGRESS_LOG"
+            rm -f "$tmp_info"
+            continue
+          elif [ "$rc_pf" -eq 3 ]; then
+            ce_warn "    Candidate skipped (filesize > ${MAX_FILESIZE})"
+            echo "$playlist|$track|$artist|skipped_filesize" >> "$PROGRESS_LOG"
+            rm -f "$tmp_info"
+            continue
+          elif [ "$rc_pf" -eq 4 ]; then
+            ce_warn "    Candidate skipped (views < ${MIN_VIEWS})"
+            echo "$playlist|$track|$artist|skipped_views" >> "$PROGRESS_LOG"
+            rm -f "$tmp_info"
+            continue
+          fi
+        fi
+        rm -f "$tmp_info"
         tmp_err=$(mktemp)
         $YTDLP_BIN --no-warnings --no-overwrites --no-playlist "${CURRENT_YTDLP_ARGS[@]}" -o "$tmpd/%(id)s.%(ext)s" -f bestaudio "ytsearch1:${q}" --extract-audio --audio-format mp3 --audio-quality 0 2> "$tmp_err"
         rc=$?
