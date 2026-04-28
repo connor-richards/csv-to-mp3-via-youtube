@@ -2,14 +2,19 @@
 """Download MP3s from a Spotify-export CSV file using yt-dlp, with resumable progress.
 
 For each CSV row the script:
-  1. Issues a fast flat YouTube search (ytsearch1:) to get a video URL
+  1. Generates a deterministic filename from CSV artist and track name.
+     If the file already exists, skip (duplicate detection via filename).
+  2. Issues a fast flat YouTube search (ytsearch1:) to get a video URL
      without triggering the yt-dlp player-client loop.
-  2. Fetches full metadata for that specific URL (one player client,
+  3. Fetches full metadata for that specific URL (one player client,
      hard timeout via subprocess).
-  3. Runs preflight checks: duration, estimated filesize, view count.
-  4. Downloads the video and extracts a 192 kbps MP3 via ffmpeg.
+  4. Runs preflight checks: duration, estimated filesize, view count.
+  5. Downloads the video and extracts a 192 kbps MP3 via ffmpeg.
 
-Files are written directly into <target_dir> named by YouTube video title.
+Files are written to <target_dir> with names derived from CSV data (Artist - Track.mp3).
+This consistent naming enables duplicate detection: any YouTube video of the same
+song is recognized by filename and skipped automatically.
+
 All outcomes logged to <target_dir>/.ydl_state/progress.log (query|status|detail|timestamp).
 
 Resume & Retry:
@@ -42,6 +47,39 @@ from ydl_helpers import (
 )
 
 
+class Colors:
+    """ANSI color codes for terminal output."""
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    
+    # Foreground colors
+    BLACK = "\033[30m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    WHITE = "\033[37m"
+    
+    # Bright colors
+    BRIGHT_BLACK = "\033[90m"
+    BRIGHT_RED = "\033[91m"
+    BRIGHT_GREEN = "\033[92m"
+    BRIGHT_YELLOW = "\033[93m"
+    BRIGHT_BLUE = "\033[94m"
+    BRIGHT_MAGENTA = "\033[95m"
+    BRIGHT_CYAN = "\033[96m"
+    BRIGHT_WHITE = "\033[97m"
+
+
+def colored(text: str, color: str, bold: bool = False) -> str:
+    """Apply color to text for terminal output."""
+    prefix = f"{Colors.BOLD}" if bold else ""
+    return f"{prefix}{color}{text}{Colors.RESET}"
+
+
 def safe_mkdir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -52,6 +90,35 @@ def build_query(row: dict) -> str:
     artist = row.get("Artist name") or row.get("Artist") or ""
     q = f"{track} {artist}".strip()
     return q or track or artist
+
+
+def build_filename(row: dict) -> str:
+    """Build a consistent filename from CSV artist and track name.
+    
+    Returns: "Artist - Track" with sanitized characters suitable for filenames.
+    This ensures the same song from different YouTube videos gets the same filename,
+    enabling proper duplicate detection and file skipping.
+    """
+    track = (row.get("Track name") or row.get("Track") or row.get("title") or "").strip()
+    artist = (row.get("Artist name") or row.get("Artist") or "").strip()
+    
+    if not track:
+        # Fallback to query-based naming if no track name
+        return None
+    
+    # Use "Artist - Track" format, or just Track if no artist
+    if artist:
+        base = f"{artist} - {track}"
+    else:
+        base = track
+    
+    # Sanitize for filesystem: remove/replace problematic characters
+    # Keep alphanumerics, spaces, hyphens, underscores, and parentheses
+    import re
+    safe = re.sub(r'[<>:"/\\|?*]', '', base)  # Remove forbidden chars
+    safe = re.sub(r'\s+', ' ', safe).strip()  # Normalize whitespace
+    
+    return safe if safe else None
 
 
 def load_progress_log(progress_log_path: str) -> dict:
@@ -142,10 +209,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         skip_queries = already_processed
     
     if skip_queries:
-        print(f"Skipping {len(skip_queries)} already-processed entries (use --retry* flags to reprocess)")
+        remaining = sum(1 for line in open(csvfile) if line.strip() and not line.startswith('"Track')) - len(skip_queries)
+        print(colored(f"⊘ Skipping {len(skip_queries)} already-processed entries", Colors.DIM))
+        if remaining > 0:
+            print(colored(f"→ {remaining} new entries to process", Colors.CYAN))
+        else:
+            print(colored("→ No new entries to process", Colors.YELLOW))
 
     ytd = detect_ytdlp()
-    print("Detected yt-dlp module:" , bool(ytd.get("module")), "CLI:", ytd.get("bin"))
+    print(colored(f"✓ yt-dlp module: {bool(ytd.get('module'))}", Colors.GREEN), colored(f"CLI: {ytd.get('bin')}", Colors.DIM))
 
     # smoke test
     # determine JS runtime to provide to yt-dlp (CLI/module)
@@ -158,10 +230,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             js_runtime = f"{auto[0]}:{auto[1]}"
 
     if js_runtime:
-        print("Using JS runtime:", js_runtime)
+        print(colored(f"✓ Using JS runtime: {js_runtime}", Colors.GREEN))
 
     if not args.skip_smoke_test and not dry_run:
-        print("Running smoke test...")
+        print(colored("→ Running smoke test...", Colors.CYAN))
         smoke = dump_json(
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
             cookies=args.cookies,
@@ -170,10 +242,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             js_runtime=js_runtime,
         )
         if smoke.get("__error__"):
-            print("Smoke test failed:", smoke.get("__error__").get("message"))
-            print("Hint: provide cookies or user-agent, or run with --skip-smoke-test to continue")
+            print(colored(f"✗ Smoke test failed: {smoke.get('__error__').get('message')}", Colors.RED, bold=True))
+            print(colored("Hint: provide cookies or user-agent, or run with --skip-smoke-test to continue", Colors.YELLOW))
             return 3
-        print("Smoke OK")
+        print(colored("✓ Smoke test OK", Colors.GREEN))
 
     def is_channel_url(url: str) -> bool:
         """Return True if url points to a channel or playlist, not a specific video."""
@@ -229,21 +301,42 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         return None
 
+    # Count total entries to process
+    # utf-8-sig strips the BOM that Spotify (and many Windows apps) prepend,
+    # which otherwise corrupts the first column name ('Track name' -> '\ufeffTrack name')
+    total_entries = 0
+    with open(csvfile, newline="", encoding="utf-8-sig") as fh:
+        total_entries = sum(1 for _ in csv.DictReader(fh))
+    if limit and limit < total_entries:
+        total_entries = limit
+    print(colored(f"\n📦 Total entries: {total_entries}", Colors.BLUE, bold=True))
+    print("-" * 70)
+
     processed = 0
-    with open(csvfile, newline="", encoding="utf-8") as fh:
+    with open(csvfile, newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
             if limit and processed >= limit:
                 break
             processed += 1
+            
+            # Extract track and artist names
+            track = (row.get("Track name") or row.get("Track") or row.get("title") or "").strip()
+            artist = (row.get("Artist name") or row.get("Artist") or "").strip()
             query = build_query(row)
+            
+            # Format progress header
+            progress_str = colored(f"[{processed}/{total_entries}]", Colors.CYAN, bold=True)
+            track_str = colored(track, Colors.BRIGHT_WHITE, bold=True) if track else colored("[no track]", Colors.DIM)
+            artist_str = colored(artist, Colors.BRIGHT_WHITE) if artist else colored("[no artist]", Colors.DIM)
             
             # Skip if already processed and not retrying
             if query in skip_queries:
-                print(f"\n[{processed}] Query: {query} [SKIPPED: already processed]")
+                print(f"\n{progress_str} {track_str} - {artist_str}")
+                print(colored("  ⊘ Already processed (cached skip)", Colors.YELLOW, bold=True))
                 continue
             
-            print(f"\n[{processed}] Query: {query}")
+            print(f"\n{progress_str} {track_str} - {artist_str}")
             # Step 1: flat search — get video URL quickly without fetching full metadata.
             # Using --flat-playlist means yt-dlp returns just id/title/url for each
             # search result without running the player client to get formats.
@@ -251,7 +344,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             flat_info = dump_json(search, cookies=args.cookies, cookies_from_browser=args.cookies_from_browser, user_agent=args.user_agent, js_runtime=js_runtime, timeout=30, flat=True)
             if flat_info.get("__error__"):
                 reason = flat_info.get("__error__").get("message")
-                print(f"  Search failed: {reason}")
+                print(colored(f"  ✗ Search failed: {reason}", Colors.RED, bold=True))
                 write_progress_entry(progress_log, query, "FAILED", f"search_error:{reason[:100]}")
                 with open(failed_log, "a", encoding="utf-8") as ff:
                     ff.write(f"{query}\tERROR\t{reason}\n")
@@ -263,9 +356,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             # If flat search returned a channel/playlist URL, retry with refined query
             if flat_entry is None or is_channel_url(flat_entry.get("webpage_url") or flat_entry.get("url") or ""):
                 if flat_entry is not None:
-                    print(f"  Search returned a channel/playlist URL; retrying with refined query...")
+                    print(colored("  → Detected channel/playlist; retrying with refined query...", Colors.YELLOW))
                 else:
-                    print("  No immediate video result; trying refined query...")
+                    print(colored("  → No immediate result; trying refined query...", Colors.YELLOW))
                 refined = f"{query} official audio"
                 flat_info2 = dump_json(f"ytsearch5:{refined}", cookies=args.cookies, cookies_from_browser=args.cookies_from_browser, user_agent=args.user_agent, js_runtime=js_runtime, timeout=30, flat=True)
                 flat_entry = None
@@ -276,7 +369,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                             break
 
             if not flat_entry:
-                print("  No result from search")
+                print(colored("  ✗ No result from search", Colors.RED, bold=True))
                 write_progress_entry(progress_log, query, "FAILED", "no_search_result")
                 with open(failed_log, "a", encoding="utf-8") as ff:
                     ff.write(f"{query}\tNO_RESULT\n")
@@ -288,7 +381,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             info = dump_json(video_url, cookies=args.cookies, cookies_from_browser=args.cookies_from_browser, user_agent=args.user_agent, js_runtime=js_runtime, timeout=60)
             if info.get("__error__"):
                 reason = info.get("__error__").get("message")
-                print(f"  Preflight failure (yt-dlp error): {reason}")
+                print(colored(f"  ✗ Metadata error: {reason}", Colors.RED, bold=True))
                 write_progress_entry(progress_log, query, "FAILED", f"metadata_error:{reason[:100]}")
                 with open(failed_log, "a", encoding="utf-8") as ff:
                     ff.write(f"{query}\tERROR\t{reason}\n")
@@ -297,7 +390,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             entry = pick_best_video(info) or info
 
             if not entry:
-                print("  No result from search")
+                print(colored("  ✗ No result from metadata", Colors.RED, bold=True))
                 write_progress_entry(progress_log, query, "FAILED", "no_result_after_metadata")
                 with open(failed_log, "a", encoding="utf-8") as ff:
                     ff.write(f"{query}\tNO_RESULT\n")
@@ -305,10 +398,28 @@ def main(argv: Optional[list[str]] = None) -> int:
 
             ok, reason = preflight_check(entry, max_duration=max_duration, max_filesize=max_filesize, min_views=min_views)
             if not ok:
-                print(f"  Skipping: {reason}")
+                print(colored(f"  ⊘ Preflight check failed: {reason}", Colors.YELLOW, bold=True))
                 write_progress_entry(progress_log, query, "SKIPPED", reason)
                 with open(failed_log, "a", encoding="utf-8") as ff:
                     ff.write(f"{query}\tSKIPPED\t{reason}\n")
+                continue
+
+            # Generate filename from CSV data for consistent duplicate detection
+            csv_filename = build_filename(row)
+            if not csv_filename:
+                print(colored("  ✗ Could not generate filename from CSV data", Colors.RED, bold=True))
+                write_progress_entry(progress_log, query, "FAILED", "no_csv_filename")
+                with open(failed_log, "a", encoding="utf-8") as ff:
+                    ff.write(f"{query}\tFAILED\tno_csv_filename\n")
+                continue
+
+            # Check if file already exists (duplicate detection via CSV-based naming)
+            existing_mp3 = os.path.join(target_dir, f"{csv_filename}.mp3")
+            if os.path.isfile(existing_mp3):
+                print(colored(f"  ✓ File already exists (skipping duplicate)", Colors.BRIGHT_BLACK, bold=True))
+                write_progress_entry(progress_log, query, "SKIPPED", "duplicate_file_exists")
+                with open(failed_log, "a", encoding="utf-8") as ff:
+                    ff.write(f"{query}\tSKIPPED\tduplicate_file_exists\n")
                 continue
 
             # choose a concrete format id when possible
@@ -316,20 +427,21 @@ def main(argv: Optional[list[str]] = None) -> int:
             chosen = fmt or "bestaudio/best"
             webpage = entry.get("webpage_url") or entry.get("url") or None
             if not webpage:
-                print("  No webpage URL available for download. Skipping.")
+                print(colored("  ✗ No webpage URL available", Colors.RED, bold=True))
                 write_progress_entry(progress_log, query, "FAILED", "no_webpage_url")
                 with open(failed_log, "a", encoding="utf-8") as ff:
                     ff.write(f"{query}\tNO_WEBPAGE\n")
                 continue
 
-            outtmpl = os.path.join(target_dir, "%(title)s.%(ext)s")
+            # Use CSV-derived filename instead of YouTube video title
+            outtmpl = os.path.join(target_dir, f"{csv_filename}.%(ext)s")
 
             if dry_run:
-                print(f"  Dry-run: would download {webpage} using format {chosen}")
+                print(colored(f"  → [DRY-RUN] Would download and convert to MP3", Colors.CYAN))
                 write_progress_entry(progress_log, query, "DRYRUN", "dry_run_mode")
                 continue
 
-            print(f"  Downloading {webpage} using format {chosen} ...")
+            print(colored(f"  → Downloading and converting to MP3...", Colors.CYAN))
             r = download_with_format(
                 webpage,
                 chosen,
@@ -341,33 +453,33 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             if not r.get("success"):
                 msg = r.get("message") or ""
-                print(f"  Download failed: {msg}")
+                print(colored(f"  ✗ Download failed", Colors.RED, bold=True))
                 lower = msg.lower()
                 # If failure appears to be due to unavailable format, try to inspect formats and retry with a concrete id
                 if ("requested format is not available" in lower) or ("format not available" in lower) or ("no formats" in lower) or ("requested format" in lower):
-                    print("  Requested format not available; inspecting formats and retrying with concrete format_id...")
+                    print(colored(f"  → Retrying with alternate format...", Colors.YELLOW))
                     meta = dump_json(webpage, cookies=args.cookies, cookies_from_browser=args.cookies_from_browser, user_agent=args.user_agent, js_runtime=js_runtime)
                     if meta.get("__error__"):
                         fallback_reason = meta.get("__error__").get("message")
-                        print(f"  Could not fetch metadata for fallback: {fallback_reason}")
+                        print(colored(f"  ✗ Could not fetch alternate metadata", Colors.RED))
                         write_progress_entry(progress_log, query, "FAILED", f"download_format_error:{msg[:80]}")
                         with open(failed_log, "a", encoding="utf-8") as ff:
                             ff.write(f"{query}\tDOWNLOAD_FAILED\t{msg[:200]} | fallback_meta_error:{(fallback_reason or '')[:200]}\n")
                     else:
                         fmt2 = select_format_id(meta)
                         if fmt2:
-                            print(f"  Retrying download with concrete format id {fmt2} ...")
+                            print(colored(f"  → Retrying download with alternate format ID...", Colors.YELLOW))
                             r2 = download_with_format(webpage, fmt2, outtmpl, cookies=args.cookies, cookies_from_browser=args.cookies_from_browser, user_agent=args.user_agent, js_runtime=js_runtime)
                             if r2.get("success"):
-                                print(f"  Download succeeded with format id {fmt2}")
+                                print(colored(f"  ✓ Download succeeded with alternate format", Colors.GREEN, bold=True))
                                 write_progress_entry(progress_log, query, "SUCCESS", f"retry_with_format:{fmt2}")
                             else:
-                                print(f"  Retry failed: {r2.get('message')}")
+                                print(colored(f"  ✗ Retry failed", Colors.RED, bold=True))
                                 write_progress_entry(progress_log, query, "FAILED", f"download_retry_failed:{r2.get('message')[:80]}")
                                 with open(failed_log, "a", encoding="utf-8") as ff:
                                     ff.write(f"{query}\tDOWNLOAD_FAILED_RETRY\t{(r2.get('message') or '')[:200]}\n")
                         else:
-                            print("  No audio-capable format id found to retry.")
+                            print(colored(f"  ✗ No audio-capable format found", Colors.RED, bold=True))
                             write_progress_entry(progress_log, query, "FAILED", "no_audio_formats")
                             with open(failed_log, "a", encoding="utf-8") as ff:
                                 ff.write(f"{query}\tNO_AUDIO_FORMATS\n")
@@ -376,13 +488,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                     with open(failed_log, "a", encoding="utf-8") as ff:
                         ff.write(f"{query}\tDOWNLOAD_FAILED\t{msg[:200]}\n")
             else:
-                print("  Download succeeded")
+                print(colored(f"  ✓ Download succeeded", Colors.GREEN, bold=True))
                 write_progress_entry(progress_log, query, "SUCCESS", "downloaded")
 
             # be polite to services
             time.sleep(0.5)
 
-    print(f"\nProcessed: {processed}")
+    print(f"\n{colored('-' * 70, Colors.DIM)}")
+    print(colored(f"✓ Completed: {processed}/{total_entries} entries processed", Colors.GREEN, bold=True))
     return 0
 
 
