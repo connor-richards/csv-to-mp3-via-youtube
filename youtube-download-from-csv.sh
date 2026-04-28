@@ -113,13 +113,38 @@ maxfs=parse_size(maxfs_str)
 min_views=parse_count(min_views_str) if min_views_str else None
 try:
   with open(fn,'r') as fh:
-    data=json.load(fh)
+    text = fh.read()
+    try:
+      data = json.loads(text)
+    except Exception:
+      # try line-delimited JSON (yt-dlp may emit multiple JSON objects); pick first valid one
+      data = None
+      for line in text.splitlines():
+        line=line.strip()
+        if not line: continue
+        try:
+          data = json.loads(line)
+          break
+        except:
+          continue
+      if data is None:
+        sys.exit(0)
 except Exception:
   sys.exit(0)
 duration = data.get('duration') or 0
 if maxdur and duration and duration > maxdur:
   print('duration_exceeded')
   sys.exit(2)
+# check view count (if provided) against min_views
+view_count = data.get('view_count')
+if min_views and view_count is not None:
+  try:
+    vc = int(view_count)
+  except:
+    vc = None
+  if vc is not None and vc < min_views:
+    print('views_too_low')
+    sys.exit(4)
 formats = data.get('formats') or []
 bestaudio = None
 for f in formats:
@@ -234,6 +259,56 @@ if [ -z "$YTDLP_BIN" ]; then
 fi
 
 command -v ffmpeg >/dev/null 2>&1 || ce_warn "Warning: ffmpeg not found. Real downloads may fail without ffmpeg."
+
+# Optional smoke test to verify yt-dlp can fetch metadata (useful during tests)
+ytdlp_smoke_test() {
+  if [ -z "${YTDLP_BIN:-}" ]; then
+    ce_warn "yt-dlp not found; cannot run smoke test."
+    return 1
+  fi
+  if [ "${SKIP_SMOKE_TEST:-0}" = "1" ]; then
+    ce_warn "Skipping yt-dlp smoke test (SKIP_SMOKE_TEST=1)"
+    return 0
+  fi
+  local url="${SMOKE_TEST_URL:-https://www.youtube.com/watch?v=dQw4w9WgXcQ}"
+  local tmpf
+  tmpf=$(mktemp)
+  # run a lightweight metadata fetch
+  "$YTDLP_BIN" --no-warnings --no-playlist --skip-download --dump-json "$url" > "$tmpf" 2>&1 || true
+  local out
+  out=$(cat "$tmpf" || true)
+  rm -f "$tmpf"
+  if [ -z "$out" ]; then
+    ce_warn "yt-dlp smoke test produced no output."
+    return 2
+  fi
+  if printf '%s' "$out" | grep -Ei 'Sign in to confirm|not a bot|Failed to decrypt with DPAPI|could not find .* cookies database' >/dev/null 2>&1; then
+    ce_warn "yt-dlp smoke test indicates auth/cookie requirement."
+    return 3
+  fi
+  if printf '%s' "$out" | grep -Ei 'HTTP Error 429|Too Many Requests|rate limit|quota' >/dev/null 2>&1; then
+    ce_warn "yt-dlp smoke test indicates rate-limiting."
+    return 4
+  fi
+  if printf '%s' "$out" | grep -Ei '"id"|"webpage_url"|"title"' >/dev/null 2>&1; then
+    ce_info "yt-dlp smoke test OK."
+    return 0
+  fi
+  ce_warn "yt-dlp smoke test returned unexpected output."
+  return 5
+}
+
+# Run a quick smoke test to detect blocking when performing real downloads
+if [ -n "${YTDLP_BIN:-}" ] && [ "$DRY_RUN" -eq 0 ]; then
+  ytdlp_smoke_test
+  rc_smoke=$?
+  if [ "$rc_smoke" -ne 0 ]; then
+    ce_error "yt-dlp smoke test failed (rc=$rc_smoke). This environment may be blocked or requires authentication/proxy."
+    ce_info "Hints: provide cookies via YTDLP_COOKIES_FILE or YTDLP_COOKIES_FROM_BROWSER, set YTDLP_USER_AGENT, or use YTDLP_PROXY to route traffic."
+    ce_info "To force continuation despite smoke test failures set SKIP_SMOKE_TEST=1 in the environment."
+    exit 1
+  fi
+fi
 
 STATE_DIR="$TARGET_DIR/.ydl_state"
 mkdir -p "$STATE_DIR"
@@ -515,9 +590,10 @@ while IFS=$'\t' read -r playlist track artist || [ -n "$track" ]; do
         for q in "${queries[@]}"; do
           echo "    Query: $q"
           build_ytdlp_args "$attempt"
-          # preflight: inspect metadata to skip long/large candidates
+          # preflight: inspect metadata to skip long/large candidates; prefer downloading the direct video URL
           tmp_info=$(mktemp)
           $YTDLP_BIN --no-warnings --no-playlist --skip-download --dump-json "${CURRENT_YTDLP_ARGS[@]}" "ytsearch1:${q}" > "$tmp_info" 2>/dev/null || true
+          dl_url=""
           if [ -s "$tmp_info" ]; then
             preflight_check "$tmp_info"
             rc_pf=$?
@@ -526,21 +602,62 @@ while IFS=$'\t' read -r playlist track artist || [ -n "$track" ]; do
               echo "$playlist|$track|$artist|skipped_duration" >> "$PROGRESS_LOG"
               rm -f "$tmp_info"
               continue
-                      elif [ "$rc_pf" -eq 3 ]; then
+            elif [ "$rc_pf" -eq 3 ]; then
               ce_warn "    Dry-run: candidate skipped (filesize > ${MAX_FILESIZE})"
               echo "$playlist|$track|$artist|skipped_filesize" >> "$PROGRESS_LOG"
               rm -f "$tmp_info"
               continue
-                      elif [ "$rc_pf" -eq 4 ]; then
-                        ce_warn "    Dry-run: candidate skipped (views < ${MIN_VIEWS})"
-                        echo "$playlist|$track|$artist|skipped_views" >> "$PROGRESS_LOG"
-                        rm -f "$tmp_info"
-                        continue
+            elif [ "$rc_pf" -eq 4 ]; then
+              ce_warn "    Dry-run: candidate skipped (views < ${MIN_VIEWS})"
+              echo "$playlist|$track|$artist|skipped_views" >> "$PROGRESS_LOG"
+              rm -f "$tmp_info"
+              continue
             fi
+            # extract a direct URL for the top search result to avoid playlist download quirks
+            dl_url=$($PY_EXEC - "$tmp_info" <<'PY'
+import sys,json
+fn=sys.argv[1]
+def first_json(fn):
+  try:
+    return json.load(open(fn))
+  except:
+    with open(fn) as fh:
+      for line in fh:
+        line=line.strip()
+        if not line: continue
+        try:
+          return json.loads(line)
+        except:
+          continue
+  return None
+data=first_json(fn)
+if not data:
+  sys.exit(0)
+# search results may be a playlist with 'entries'
+entry = None
+if isinstance(data, dict) and data.get('entries'):
+  entries = data.get('entries')
+  if isinstance(entries, list) and entries:
+    entry = entries[0]
+elif isinstance(data, list) and data:
+  entry = data[0]
+else:
+  entry = data
+if not entry:
+  sys.exit(0)
+url = entry.get('webpage_url') or entry.get('url') or entry.get('original_url') or ('https://www.youtube.com/watch?v=' + str(entry.get('id','')))
+print(url)
+PY
+)
           fi
           rm -f "$tmp_info"
           tmp_err=$(mktemp)
-          fn=$($YTDLP_BIN --no-warnings --no-playlist --get-filename -o "%(title)s.%(ext)s" "${CURRENT_YTDLP_ARGS[@]}" "ytsearch1:${q}" 2> "$tmp_err" | head -n1 || true)
+          # determine what to ask yt-dlp to resolve for filenames (prefer direct URL when available)
+          if [ -n "$dl_url" ]; then
+            fn=$($YTDLP_BIN --no-warnings --no-playlist --get-filename -o "%(title)s.%(ext)s" "${CURRENT_YTDLP_ARGS[@]}" "$dl_url" 2> "$tmp_err" | head -n1 || true)
+          else
+            fn=$($YTDLP_BIN --no-warnings --no-playlist --get-filename -o "%(title)s.%(ext)s" "${CURRENT_YTDLP_ARGS[@]}" "ytsearch1:${q}" 2> "$tmp_err" | head -n1 || true)
+          fi
           err=$(cat "$tmp_err" || true)
           rm -f "$tmp_err"
           if [ -n "$fn" ]; then
@@ -571,7 +688,7 @@ while IFS=$'\t' read -r playlist track artist || [ -n "$track" ]; do
       for q in "${queries[@]}"; do
         echo "    Query: $q"
         build_ytdlp_args "$attempt"
-        # preflight: inspect metadata to skip long/large candidates
+        # preflight: inspect metadata to skip long/large candidates; prefer a direct video URL
         tmp_info=$(mktemp)
         $YTDLP_BIN --no-warnings --no-playlist --skip-download --dump-json "${CURRENT_YTDLP_ARGS[@]}" "ytsearch1:${q}" > "$tmp_info" 2>/dev/null || true
         if [ -s "$tmp_info" ]; then
@@ -593,14 +710,70 @@ while IFS=$'\t' read -r playlist track artist || [ -n "$track" ]; do
             rm -f "$tmp_info"
             continue
           fi
+          dl_url=$($PY_EXEC - "$tmp_info" <<'PY'
+import sys,json
+fn=sys.argv[1]
+def first_json(fn):
+  try:
+    return json.load(open(fn))
+  except:
+    with open(fn) as fh:
+      for line in fh:
+        line=line.strip()
+        if not line: continue
+        try:
+          return json.loads(line)
+        except:
+          continue
+  return None
+data=first_json(fn)
+if not data:
+  sys.exit(0)
+entry = None
+if isinstance(data, dict) and data.get('entries'):
+  entries = data.get('entries')
+  if isinstance(entries, list) and entries:
+    entry = entries[0]
+elif isinstance(data, list) and data:
+  entry = data[0]
+else:
+  entry = data
+if not entry:
+  sys.exit(0)
+url = entry.get('webpage_url') or entry.get('url') or entry.get('original_url') or ('https://www.youtube.com/watch?v=' + str(entry.get('id','')))
+print(url)
+PY
+)
         fi
         rm -f "$tmp_info"
-        tmp_err=$(mktemp)
-        $YTDLP_BIN --no-warnings --no-overwrites --no-playlist "${CURRENT_YTDLP_ARGS[@]}" -o "$tmpd/%(id)s.%(ext)s" -f bestaudio "ytsearch1:${q}" --extract-audio --audio-format mp3 --audio-quality 0 2> "$tmp_err"
-        rc=$?
-        err=$(cat "$tmp_err" || true)
-        rm -f "$tmp_err"
-        found=$(find "$tmpd" -type f -iname '*.mp3' -print -quit || true)
+        # If we have a direct URL, download that; otherwise fall back to search query
+        target_source="$([ -n "${dl_url:-}" ] && printf "%s" "${dl_url}" || printf "ytsearch1:%s" "$q")"
+        # Try several format selections to handle videos where 'bestaudio' isn't available
+        found=''
+        for fmt_choice in 'bestaudio' 'bestaudio/best' 'best' ''; do
+          tmp_err=$(mktemp)
+          if [ -n "$fmt_choice" ]; then
+            $YTDLP_BIN --no-warnings --no-overwrites --no-playlist "${CURRENT_YTDLP_ARGS[@]}" -o "$tmpd/%(id)s.%(ext)s" -f "$fmt_choice" "$target_source" --extract-audio --audio-format mp3 --audio-quality 0 2> "$tmp_err"
+          else
+            $YTDLP_BIN --no-warnings --no-overwrites --no-playlist "${CURRENT_YTDLP_ARGS[@]}" -o "$tmpd/%(id)s.%(ext)s" "$target_source" --extract-audio --audio-format mp3 --audio-quality 0 2> "$tmp_err"
+          fi
+          rc=$?
+          err=$(cat "$tmp_err" || true)
+          rm -f "$tmp_err"
+          found=$(find "$tmpd" -type f -iname '*.mp3' -print -quit || true)
+          if [ -n "$found" ] && [ -s "$found" ]; then
+            break
+          fi
+          # if error indicates requested format not available, try next fmt_choice
+          if echo "$err" | grep -Ei 'Requested format is not available|format not available' >/dev/null 2>&1; then
+            ce_warn "    Format '$fmt_choice' not available; trying fallback format..."
+            continue
+          fi
+          # If other non-recoverable error, break and handle normally
+          if [ $rc -ne 0 ]; then
+            break
+          fi
+        done
         if [ -n "$found" ] && [ -s "$found" ]; then
           mv "$found" "$target"
           ce_success "  Saved: $target"
