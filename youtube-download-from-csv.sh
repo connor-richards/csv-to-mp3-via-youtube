@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # youtube-download-from-csv.sh
-# Read a CSV of tracks, search each song on YouTube, download as MP3,
-# and sort into playlist directories under a target directory.
-# Usage: youtube-download-from-csv.sh input.csv target_dir
+# Read a CSV of tracks, search each song on YouTube, download as MP3.
+# By default files are saved directly under the target directory.
+# If --use-playlists is provided, files are sorted into <target_dir>/<playlist>/.
+# Usage: youtube-download-from-csv.sh [--use-playlists] [--enable-sleep] input.csv target_dir
 # Requires: yt-dlp, python3, ffmpeg (for audio conversion)
 
 set -uo pipefail
@@ -10,20 +11,23 @@ set -uo pipefail
 DRY_RUN=0
 LIMIT=0
 START_INDEX=1
+USE_PLAYLISTS=0
+ENABLE_SLEEP=0
 
 usage() {
   cat <<USAGE
-Usage: $0 [--dry-run] [--limit N] <input.csv> <target_dir>
+Usage: $0 [--dry-run] [--limit N] [--start N] [--use-playlists] [--enable-sleep] <input.csv> <target_dir>
 
-Downloads tracks listed in the CSV into <target_dir>/<playlist>/ as MP3.
-CSV must contain a header with fields such as "Track name", "Artist name",
-and "Playlist name". The script is tolerant of missing headers and will
-attempt to use columns by position when needed.
+Downloads tracks listed in the CSV into <target_dir>/ as MP3 by default.
+If --use-playlists is supplied, files are sorted into <target_dir>/<playlist>/.
+CSV should include fields such as "Track name" and "Artist name". "Playlist name" is optional.
 
 Options:
-  --dry-run     : don't download; show what would be downloaded
-  --limit N     : process only the first N tracks
-  --start N     : start processing at the Nth track (1-based)
+  --dry-run       : don't download; show what would be downloaded
+  --limit N       : process only the first N tracks
+  --start N       : start processing at the Nth track (1-based)
+  --use-playlists : sort downloaded files into playlist folders under target dir
+  --enable-sleep  : enable randomized sleep between tracks (uses SLEEP_MIN/SLEEP_MAX env vars)
 
 Requires: yt-dlp, python3, ffmpeg (ffmpeg only needed for real downloads)
 USAGE
@@ -39,6 +43,10 @@ while [ "$#" -gt 0 ]; do
       LIMIT="$2"; shift 2 ;;
     --start|-s)
       START_INDEX="$2"; shift 2 ;;
+    --use-playlists)
+      USE_PLAYLISTS=1; shift ;;
+    --enable-sleep)
+      ENABLE_SLEEP=1; shift ;;
     --help|-h)
       usage ;;
     --*)
@@ -158,7 +166,7 @@ if [ -n "${YTDLP_RETRY_SLEEP:-}" ]; then
   YTDLP_EXTRA_ARGS+=(--retry-sleep "${YTDLP_RETRY_SLEEP}")
 fi
 
-# jittered sleep config (seconds)
+# jittered sleep config (seconds; used only when --enable-sleep is passed)
 SLEEP_MIN=${SLEEP_MIN:-1}
 SLEEP_MAX=${SLEEP_MAX:-3}
 
@@ -310,10 +318,15 @@ while IFS=$'\t' read -r playlist track artist || [ -n "$track" ]; do
     echo "Reached limit ($LIMIT). Stopping."
     break
   fi
-  [ -z "$playlist" ] && playlist="Unknown"
-  pdir=$(sanitize "$playlist")
-  tdir="$TARGET_DIR/$pdir"
-  mkdir -p "$tdir"
+  if [ "$USE_PLAYLISTS" -eq 1 ]; then
+    [ -z "$playlist" ] && playlist="Unknown"
+    pdir=$(sanitize "$playlist")
+    tdir="$TARGET_DIR/$pdir"
+    mkdir -p "$tdir"
+  else
+    tdir="$TARGET_DIR"
+    mkdir -p "$tdir"
+  fi
   fname=$(sanitize "$track - $artist")
   target="$tdir/$fname.mp3"
 
@@ -421,18 +434,20 @@ while IFS=$'\t' read -r playlist track artist || [ -n "$track" ]; do
   fi
 
   rm -rf "$tmpd"
-  # small randomized sleep between tracks to reduce rate-limiting/bot-detection
-  if [ "$SLEEP_MAX" -ge "$SLEEP_MIN" ] && [ "$SLEEP_MAX" -gt 0 ]; then
-    min=$SLEEP_MIN; max=$SLEEP_MAX
-    if [ "$max" -lt "$min" ]; then max=$min; fi
-    if [ "$min" -eq "$max" ]; then
-      sleep_time=$min
-    else
-      range=$((max - min + 1))
-      sleep_time=$((min + RANDOM % range))
+  # small randomized sleep between tracks to reduce rate-limiting/bot-detection (optional)
+  if [ "$ENABLE_SLEEP" -eq 1 ]; then
+    if [ "$SLEEP_MAX" -ge "$SLEEP_MIN" ] && [ "$SLEEP_MAX" -gt 0 ]; then
+      min=$SLEEP_MIN; max=$SLEEP_MAX
+      if [ "$max" -lt "$min" ]; then max=$min; fi
+      if [ "$min" -eq "$max" ]; then
+        sleep_time=$min
+      else
+        range=$((max - min + 1))
+        sleep_time=$((min + RANDOM % range))
+      fi
+      echo "Sleeping $sleep_time seconds before next track..."
+      sleep "$sleep_time"
     fi
-    echo "Sleeping $sleep_time seconds before next track..."
-    sleep "$sleep_time"
   fi
 done < "$TMP_TSV"
 
