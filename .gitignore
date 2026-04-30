@@ -22,6 +22,7 @@ Icon\r
 
 # Ignore local CSV export (do not commit large exported libraries)
 *.csv
+*:Zone.Identifier
 
 # Ignore cookies file (do not commit sensitive information)
-cookies.txt
+*.txt

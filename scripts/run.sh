@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Prefer a local venv python if present
-if [ -x ".venv/bin/python" ]; then
+# Resolve script directory so the script works from any working directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Prefer a local venv python if present (ensures updated yt-dlp is used)
+if [ -x "$ROOT_DIR/.venv/bin/python" ]; then
+  PY="$ROOT_DIR/.venv/bin/python"
+elif [ -x ".venv/bin/python" ]; then
   PY=.venv/bin/python
 else
   PY=$(command -v python3 || true)

@@ -84,6 +84,24 @@ def _parse_first_json_from_text(text: str) -> t.Optional[dict]:
     return None
 
 
+def _parse_all_json_from_text(text: str) -> t.Optional[list]:
+    """Parse all JSON objects from text (one per line).
+    
+    Used for flat search results where yt-dlp outputs multiple JSON objects.
+    Returns a list of dicts, or None if no JSON objects could be parsed.
+    """
+    entries = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except Exception:
+            continue
+    return entries if entries else None
+
+
 def dump_json(url: str, *, cookies: t.Optional[str] = None, user_agent: t.Optional[str] = None,
               cookies_from_browser: t.Optional[str] = None, js_runtime: t.Optional[str] = None,
               timeout: int = 30, flat: bool = False) -> dict:
@@ -154,6 +172,69 @@ def dump_json(url: str, *, cookies: t.Optional[str] = None, user_agent: t.Option
         return parsed
 
     # no JSON found but stdout had data: return a short error-containing dict
+    return {"__error__": {"message": content}}
+
+
+def dump_json_flat_search(url: str, *, cookies: t.Optional[str] = None, user_agent: t.Optional[str] = None,
+                          cookies_from_browser: t.Optional[str] = None, js_runtime: t.Optional[str] = None,
+                          timeout: int = 30) -> dict:
+    """Return all search/playlist entries for a flat search URL.
+    
+    Returns a dict with "entries" key containing a list of all results.
+    Similar to dump_json(..., flat=True) but returns ALL entries, not just the first.
+    This is used for ytsearch:N queries to get multiple results for scoring.
+    
+    Returns:
+      - {"entries": [list of video dicts]} on success
+      - {"__error__": {"message": str}} on error
+    """
+    ytd = detect_ytdlp()
+    bin_path = ytd.get("bin")
+    if not bin_path:
+        return {"__error__": {"message": "yt-dlp not installed (no module or CLI available)"}}
+
+    cmd = [
+        bin_path,
+        "--no-warnings", "--skip-download", "--dump-json",
+        "--extractor-args", "youtube:player_client=android_vr",
+        "--flat-playlist",
+        url,
+    ]
+    if cookies:
+        cmd += ["--cookies", cookies]
+    if cookies_from_browser:
+        cmd += ["--cookies-from-browser", cookies_from_browser]
+    if user_agent:
+        cmd += ["--add-header", f"User-Agent: {user_agent}"]
+    if js_runtime:
+        cmd += ["--js-runtimes", js_runtime]
+    else:
+        auto = detect_js_runtime()
+        if auto:
+            cmd += ["--js-runtimes", f"{auto[0]}:{auto[1]}"]
+
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        return {"__error__": {"message": f"yt-dlp CLI failure: {e}"}}
+
+    content = (p.stdout or "").strip()
+    if not content:
+        stderr = (p.stderr or "").strip()
+        msg = stderr or "no output from yt-dlp"
+        return {"__error__": {"message": msg}}
+
+    # Parse all JSON objects from the output
+    entries = _parse_all_json_from_text(content)
+    if entries:
+        return {"entries": entries}
+
+    # Fall back to first JSON if all-entries parsing failed
+    parsed = _parse_first_json_from_text(content)
+    if parsed is not None:
+        return {"entries": [parsed]}
+
+    # no JSON found but stdout had data
     return {"__error__": {"message": content}}
 
 
@@ -293,27 +374,35 @@ def preflight_check(info: dict, max_duration: int | None = None, max_filesize: i
     if duration and max_duration and duration > max_duration:
         return False, "duration_exceeded"
 
-    # check filesize if available or estimate from abr
-    filesize = info.get("filesize") or info.get("filesize_approx")
-    if filesize and max_filesize and filesize > max_filesize:
-        return False, "filesize_exceeded"
-
-    if (not filesize) and max_filesize:
-        # try to estimate using the highest abr available
+    # Estimate audio filesize from the best audio bitrate (abr) and duration.
+    # We intentionally do NOT use info["filesize"] / info["filesize_approx"] here:
+    # those top-level fields reflect the best *video* format (e.g. 1080p), which
+    # can easily be 50–150 MB for a normal-length music video even though the
+    # extracted MP3 will be only 3–10 MB.  Estimating from abr is more accurate
+    # for our actual output file.
+    if max_filesize:
         formats = info.get("formats") or []
         abr = None
+        audio_filesize = None
         for f in formats:
             if f.get("acodec") and f.get("acodec") != "none" and f.get("abr"):
                 try:
                     val = float(f.get("abr"))
                     if abr is None or val > abr:
                         abr = val
+                        # prefer the per-format filesize when available
+                        audio_filesize = f.get("filesize") or f.get("filesize_approx")
                 except Exception:
                     continue
-        if abr and duration:
+
+        # Use per-format audio filesize if available, otherwise estimate from abr
+        if audio_filesize:
+            if audio_filesize > max_filesize:
+                return False, "filesize_exceeded"
+        elif abr and duration:
             # abr is in kbits/s -> bytes = (kbits/s * 1000 / 8) * seconds
             est_bytes = int((abr * 1000.0 / 8.0) * float(duration))
-            if max_filesize and est_bytes > max_filesize:
+            if est_bytes > max_filesize:
                 return False, "filesize_exceeded_estimate"
 
     views = info.get("view_count")

@@ -38,6 +38,7 @@ from typing import Optional
 
 from ydl_helpers import (
     dump_json,
+    dump_json_flat_search,
     detect_ytdlp,
     detect_js_runtime,
     download_with_format,
@@ -80,6 +81,50 @@ def colored(text: str, color: str, bold: bool = False) -> str:
     return f"{prefix}{color}{text}{Colors.RESET}"
 
 
+def score_video_title(title: str) -> int:
+    """Score a video title: higher is better.
+    
+    Prefer: official audio, official
+    Avoid: live, remix, cover, acoustic
+    """
+    title_lower = title.lower()
+    score = 0
+    
+    # Boost official versions
+    if "official audio" in title_lower:
+        score += 100
+    elif "official" in title_lower:
+        score += 50
+    
+    # Penalize undesired versions
+    if "live" in title_lower:
+        score -= 100
+    if "remix" in title_lower:
+        score -= 50
+    if "cover" in title_lower:
+        score -= 30
+    if "acoustic" in title_lower:
+        score -= 20
+    
+    return score
+
+
+def get_youtube_url_from_row(row: dict) -> str:
+    """Extract optional YouTube URL from CSV row.
+    
+    Looks for columns: 'YouTube URL', 'YouTube Link', 'URL', 'Link'
+    Returns empty string if not found.
+    """
+    url = (
+        row.get("YouTube URL") or
+        row.get("YouTube Link") or
+        row.get("URL") or
+        row.get("Link") or
+        ""
+    )
+    return url.strip() if url else ""
+
+
 def safe_mkdir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -89,7 +134,8 @@ def build_query(row: dict) -> str:
     track = row.get("Track name") or row.get("Track") or row.get("title") or ""
     artist = row.get("Artist name") or row.get("Artist") or ""
     q = f"{track} {artist}".strip()
-    return q or track or artist
+    # Append "official audio" to prioritize official versions in YouTube search
+    return (q + " official audio" if q else (track or artist)) or artist
 
 
 def build_filename(row: dict) -> str:
@@ -270,7 +316,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             return True
         return False
 
-    def pick_best_video(info: dict) -> t.Optional[dict]:
+    def pick_best_video(info: dict) -> Optional[dict]:
         # Prefer a direct video-like entry. Search entries list for the
         # first item that looks like a video (has formats/duration/watch URL).
         if not isinstance(info, dict):
@@ -299,6 +345,44 @@ def main(argv: Optional[list[str]] = None) -> int:
                         if is_video_entry(ne):
                             return ne
 
+        return None
+
+    def pick_best_video_by_title(info: dict) -> Optional[dict]:
+        """Pick best video from search results, scoring by title.
+        
+        Prefers official audio, avoids live/remix/cover versions.
+        Falls back to first valid video if scoring yields no results.
+        """
+        if not isinstance(info, dict):
+            return None
+        
+        entries = []
+        if info.get("entries"):
+            if isinstance(info.get("entries"), list):
+                entries = info.get("entries")
+            else:
+                entries = [info.get("entries")]
+        
+        # Score and filter entries
+        candidates = []
+        for e in entries:
+            if is_video_entry(e):
+                url = e.get("webpage_url") or e.get("url") or ""
+                if not is_channel_url(url):
+                    title = e.get("title") or ""
+                    score = score_video_title(title)
+                    candidates.append((score, e))
+        
+        if candidates:
+            # Sort by score (highest first)
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            return candidates[0][1]
+        
+        # Fallback: if no scored candidates, return first valid video (original behavior)
+        for e in entries:
+            if is_video_entry(e) and not is_channel_url(e.get("webpage_url") or e.get("url") or ""):
+                return e
+        
         return None
 
     # Count total entries to process
@@ -337,36 +421,47 @@ def main(argv: Optional[list[str]] = None) -> int:
                 continue
             
             print(f"\n{progress_str} {track_str} - {artist_str}")
-            # Step 1: flat search — get video URL quickly without fetching full metadata.
-            # Using --flat-playlist means yt-dlp returns just id/title/url for each
-            # search result without running the player client to get formats.
-            search = f"ytsearch1:{query}"
-            flat_info = dump_json(search, cookies=args.cookies, cookies_from_browser=args.cookies_from_browser, user_agent=args.user_agent, js_runtime=js_runtime, timeout=30, flat=True)
-            if flat_info.get("__error__"):
-                reason = flat_info.get("__error__").get("message")
-                print(colored(f"  ✗ Search failed: {reason}", Colors.RED, bold=True))
-                write_progress_entry(progress_log, query, "FAILED", f"search_error:{reason[:100]}")
-                with open(failed_log, "a", encoding="utf-8") as ff:
-                    ff.write(f"{query}\tERROR\t{reason}\n")
-                continue
+            
+            # Step 0: Check for optional YouTube URL in CSV
+            manual_url = get_youtube_url_from_row(row)
+            flat_entry = None
+            
+            if manual_url:
+                # User provided a YouTube URL; use it directly
+                print(colored(f"  → Using YouTube URL from CSV", Colors.CYAN))
+                flat_entry = {"webpage_url": manual_url, "url": manual_url}
+            else:
+                # Step 1: flat search — get video URL quickly without fetching full metadata.
+                # Use dump_json_flat_search to get all 5 results, then score and pick the best.
+                search = f"ytsearch5:{query}"
+                flat_info = dump_json_flat_search(search, cookies=args.cookies, cookies_from_browser=args.cookies_from_browser, user_agent=args.user_agent, js_runtime=js_runtime, timeout=30)
+                if flat_info.get("__error__"):
+                    reason = flat_info.get("__error__").get("message")
+                    print(colored(f"  ✗ Search failed: {reason}", Colors.RED, bold=True))
+                    write_progress_entry(progress_log, query, "FAILED", f"search_error:{reason[:100]}")
+                    with open(failed_log, "a", encoding="utf-8") as ff:
+                        ff.write(f"{query}\tERROR\t{reason}\n")
+                    continue
 
-            # Pick the best video URL from flat search results
-            flat_entry = pick_best_video(flat_info)
+                # Pick the best video by title scoring (prefers official audio, avoids live)
+                flat_entry = pick_best_video_by_title(flat_info)
 
-            # If flat search returned a channel/playlist URL, retry with refined query
-            if flat_entry is None or is_channel_url(flat_entry.get("webpage_url") or flat_entry.get("url") or ""):
-                if flat_entry is not None:
-                    print(colored("  → Detected channel/playlist; retrying with refined query...", Colors.YELLOW))
-                else:
-                    print(colored("  → No immediate result; trying refined query...", Colors.YELLOW))
-                refined = f"{query} official audio"
-                flat_info2 = dump_json(f"ytsearch5:{refined}", cookies=args.cookies, cookies_from_browser=args.cookies_from_browser, user_agent=args.user_agent, js_runtime=js_runtime, timeout=30, flat=True)
-                flat_entry = None
-                if not flat_info2.get("__error__"):
-                    for e in ([pick_best_video(flat_info2)] + list(flat_info2.get("entries") or [])):
-                        if e and is_video_entry(e) and not is_channel_url(e.get("webpage_url") or e.get("url") or ""):
-                            flat_entry = e
-                            break
+                # If search returned a channel/playlist URL or nothing, retry without the extra keywords
+                if flat_entry is None or is_channel_url(flat_entry.get("webpage_url") or flat_entry.get("url") or ""):
+                    if flat_entry is not None:
+                        print(colored("  → Detected channel/playlist; retrying...", Colors.YELLOW))
+                    else:
+                        print(colored("  → No good result; retrying with broader search...", Colors.YELLOW))
+                    # Rebuild query without "official audio" for broader search
+                    base_query = (row.get("Track name") or row.get("Track") or row.get("title") or "").strip()
+                    if not base_query:
+                        base_query = (row.get("Artist name") or row.get("Artist") or "").strip()
+                    if base_query:
+                        artist_str_for_search = (row.get("Artist name") or row.get("Artist") or "").strip()
+                        broader_query = f"{base_query} {artist_str_for_search}".strip()
+                        flat_info2 = dump_json_flat_search(f"ytsearch5:{broader_query}", cookies=args.cookies, cookies_from_browser=args.cookies_from_browser, user_agent=args.user_agent, js_runtime=js_runtime, timeout=30)
+                        if not flat_info2.get("__error__"):
+                            flat_entry = pick_best_video_by_title(flat_info2)
 
             if not flat_entry:
                 print(colored("  ✗ No result from search", Colors.RED, bold=True))
