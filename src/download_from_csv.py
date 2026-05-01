@@ -81,6 +81,43 @@ def colored(text: str, color: str, bold: bool = False) -> str:
     return f"{prefix}{color}{text}{Colors.RESET}"
 
 
+def open_csv_safe(filepath: str, mode: str = "r", **kwargs):
+    """Open a CSV file with automatic encoding detection and fallback.
+    
+    Tries encodings in order: utf-8-sig, utf-8, latin-1
+    latin-1 is the final fallback since it can decode any byte sequence.
+    
+    Args:
+        filepath: Path to the CSV file
+        mode: File open mode (default: "r")
+        **kwargs: Additional arguments for open() (e.g., newline="")
+    
+    Returns:
+        Opened file handle
+    
+    Raises:
+        IOError: If all encoding attempts fail
+    """
+    encodings = ["utf-8-sig", "utf-8", "latin-1"]
+    
+    for encoding in encodings:
+        try:
+            f = open(filepath, mode, encoding=encoding, **kwargs)
+            # Verify encoding works by reading a line
+            f.readline()
+            f.seek(0)
+            return f
+        except (UnicodeDecodeError, UnicodeError):
+            try:
+                f.close()
+            except:
+                pass
+            continue
+    
+    # This should rarely happen since latin-1 can decode anything
+    raise IOError(f"Unable to open {filepath} with any supported encoding")
+
+
 def score_video_title(title: str) -> int:
     """Score a video title: higher is better.
     
@@ -255,7 +292,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         skip_queries = already_processed
     
     if skip_queries:
-        remaining = sum(1 for line in open(csvfile) if line.strip() and not line.startswith('"Track')) - len(skip_queries)
+        with open_csv_safe(csvfile) as f:
+            remaining = sum(1 for line in f if line.strip() and not line.startswith('"Track')) - len(skip_queries)
         print(colored(f"⊘ Skipping {len(skip_queries)} already-processed entries", Colors.DIM))
         if remaining > 0:
             print(colored(f"→ {remaining} new entries to process", Colors.CYAN))
@@ -389,7 +427,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # utf-8-sig strips the BOM that Spotify (and many Windows apps) prepend,
     # which otherwise corrupts the first column name ('Track name' -> '\ufeffTrack name')
     total_entries = 0
-    with open(csvfile, newline="", encoding="utf-8-sig") as fh:
+    with open_csv_safe(csvfile, newline="") as fh:
         total_entries = sum(1 for _ in csv.DictReader(fh))
     if limit and limit < total_entries:
         total_entries = limit
@@ -397,7 +435,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print("-" * 70)
 
     processed = 0
-    with open(csvfile, newline="", encoding="utf-8-sig") as fh:
+    with open_csv_safe(csvfile, newline="") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
             if limit and processed >= limit:
@@ -425,9 +463,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             # Step 0: Check for optional YouTube URL in CSV
             manual_url = get_youtube_url_from_row(row)
             flat_entry = None
+            user_provided_url = False
             
             if manual_url:
                 # User provided a YouTube URL; use it directly
+                user_provided_url = True
                 print(colored(f"  → Using YouTube URL from CSV", Colors.CYAN))
                 flat_entry = {"webpage_url": manual_url, "url": manual_url}
             else:
@@ -491,13 +531,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                     ff.write(f"{query}\tNO_RESULT\n")
                 continue
 
-            ok, reason = preflight_check(entry, max_duration=max_duration, max_filesize=max_filesize, min_views=min_views)
-            if not ok:
-                print(colored(f"  ⊘ Preflight check failed: {reason}", Colors.YELLOW, bold=True))
-                write_progress_entry(progress_log, query, "SKIPPED", reason)
-                with open(failed_log, "a", encoding="utf-8") as ff:
-                    ff.write(f"{query}\tSKIPPED\t{reason}\n")
-                continue
+            # Skip preflight checks if user provided a YouTube URL (they've already verified it)
+            if user_provided_url:
+                print(colored(f"  ✓ Skipping preflight checks (user-provided URL)", Colors.BRIGHT_BLACK))
+            else:
+                ok, reason = preflight_check(entry, max_duration=max_duration, max_filesize=max_filesize, min_views=min_views)
+                if not ok:
+                    print(colored(f"  ⊘ Preflight check failed: {reason}", Colors.YELLOW, bold=True))
+                    write_progress_entry(progress_log, query, "SKIPPED", reason)
+                    with open(failed_log, "a", encoding="utf-8") as ff:
+                        ff.write(f"{query}\tSKIPPED\t{reason}\n")
+                    continue
 
             # Generate filename from CSV data for consistent duplicate detection
             csv_filename = build_filename(row)
